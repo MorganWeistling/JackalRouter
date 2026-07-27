@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.pyd
+*.pyo
+*.pdb
+.python-version
+env/
+venv/
+.venv/
+venv.bak/
+pip-wheel-metadata/
+*.egg-info/
+dist/
+build/
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+*~
+
+# Internal docs
+promt.txt
+не пр.txt
+
+# Personal archives / IDE workspace — не для репозитория
+JackalRouter.zip
+JackalRouter.rar
+client/JackalRouter.code-workspace
+
+# Local client state (per-machine — server IP, proxy history; not for commit)
+client/client_config.json
+client/proxy_history.json
+
+# PyInstaller build output
+client/build/
+client/dist/
+client/*.spec

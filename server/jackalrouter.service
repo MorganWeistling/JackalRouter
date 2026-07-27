@@ -1,0 +1,14 @@
+[Unit]
+Description=JackalRouter FastAPI Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/jackalrouter
+ExecStart=/opt/jackalrouter/venv/bin/python3 server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

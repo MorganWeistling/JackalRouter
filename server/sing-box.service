@@ -1,0 +1,23 @@
+[Unit]
+Description=sing-box service
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target
+
+[Service]
+Type=simple
+User=root
+# Явные Linux-capabilities для TProxy (TCP И UDP перенаправляются одинаково):
+#   CAP_NET_ADMIN        — fwmark / policy-routing / TPROXY
+#   CAP_NET_RAW          — IP_TRANSPARENT сокеты (нужно для UDP-перехвата QUIC)
+#   CAP_NET_BIND_SERVICE — bind служебных портов
+# Гарантирует работу UDP/QUIC через TProxy даже если запускать не от root.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+# Скрипты для сервера ВСЕГДА должны быть с LF (иначе bash/systemd сломаются
+# при выгрузке на Windows и последующей заливке на Linux).
+*.sh          text eol=lf
+*.service     text eol=lf
+*.py          text eol=lf
+*.command     text eol=lf
+deploy.bat    text eol=crlf
