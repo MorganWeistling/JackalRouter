@@ -373,6 +373,32 @@ ip route del local default dev lo table 100 2>/dev/null || true
 ip route add local default dev lo table 100
 ok "Policy routing: fwmark 1 → таблица 100"
 
+# ── ВАЖНО: сделать policy routing постоянным ─────────────────────────────────
+# netfilter-persistent сохраняет ТОЛЬКО iptables. Правила "ip rule"/"ip route"
+# после перезагрузки исчезают, и тогда TPROXY метит пакеты меткой 1, а доставить
+# их локально ядру нечем — трафик клиентов молча пропадает. Снаружи это выглядит
+# как "раздаётся, DHCP выдаёт адрес, но интернета нет". Поэтому вешаем oneshot-
+# юнит, который восстанавливает их при каждой загрузке до старта sing-box.
+info "Делаю policy routing постоянным (переживёт перезагрузку)..."
+cat > /etc/systemd/system/jackal-policy-routing.service << 'EOF'
+[Unit]
+Description=JackalRouter: policy routing for TProxy (fwmark 1 -> table 100)
+After=network-online.target
+Wants=network-online.target
+Before=sing-box.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'ip rule add fwmark 1 table 100 2>/dev/null; ip route add local default dev lo table 100 2>/dev/null; exit 0'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable jackal-policy-routing -q 2>/dev/null || warn "Не удалось включить автозапуск policy routing"
+ok "Policy routing восстанавливается при загрузке (jackal-policy-routing.service)"
+
 # ── MSS clamp 1280 ────────────────────────────────────────────────────────────
 info "MSS clamp 1280 на $LAN_IFACE..."
 iptables -t mangle -D PREROUTING -i "$LAN_IFACE" -p tcp --tcp-flags SYN,RST SYN \
@@ -401,15 +427,23 @@ ok "TProxy: весь UDP+TCP → sing-box :$SINGBOX_PORT (QUIC через про
 
 # ── MASQUERADE + FORWARD ──────────────────────────────────────────────────────
 info "MASQUERADE и FORWARD..."
+# WAN-сторона намеренно НЕ привязана к имени интерфейса (! -o LAN_IFACE, а не
+# -o WAN_IFACE): если интернет-адаптер сменится (переключение Wi-Fi сети,
+# другой кабель/донгл, смена имени интерфейса) — правила не придётся
+# переприменять, всё, что не в LAN, продолжит маскироваться автоматически.
 iptables -t nat -D POSTROUTING -o "$WAN_IFACE" -j MASQUERADE 2>/dev/null || true
-iptables -t nat -A POSTROUTING -o "$WAN_IFACE" -j MASQUERADE
+iptables -t nat -C POSTROUTING ! -o "$LAN_IFACE" -j MASQUERADE 2>/dev/null \
+    || iptables -t nat -A POSTROUTING ! -o "$LAN_IFACE" -j MASQUERADE
 iptables -D FORWARD -i "$LAN_IFACE" -o "$WAN_IFACE" -j ACCEPT 2>/dev/null || true
 iptables -D FORWARD -i "$WAN_IFACE" -o "$LAN_IFACE" \
     -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-iptables -A FORWARD -i "$LAN_IFACE" -o "$WAN_IFACE" -j ACCEPT
-iptables -A FORWARD -i "$WAN_IFACE" -o "$LAN_IFACE" \
+iptables -C FORWARD -i "$LAN_IFACE" ! -o "$LAN_IFACE" -j ACCEPT 2>/dev/null \
+    || iptables -A FORWARD -i "$LAN_IFACE" ! -o "$LAN_IFACE" -j ACCEPT
+iptables -C FORWARD ! -i "$LAN_IFACE" -o "$LAN_IFACE" \
+    -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+    || iptables -A FORWARD ! -i "$LAN_IFACE" -o "$LAN_IFACE" \
     -m state --state RELATED,ESTABLISHED -j ACCEPT
-ok "MASQUERADE + FORWARD: $LAN_IFACE ↔ $WAN_IFACE"
+ok "MASQUERADE + FORWARD настроены (переживут смену WAN-сети/адаптера)"
 
 # ── IPv6 leak prevention ──────────────────────────────────────────────────────
 info "Блокирую IPv6 из LAN..."
@@ -445,8 +479,21 @@ ok "sing-box v${SINGBOX_VERSION}  (сборка linux-${SB_ARCH})"
 info "Скачиваю sing-box для ${SB_ARCH}..."
 STMP=$(mktemp -d)
 SINGBOX_URL="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-${SB_ARCH}.tar.gz"
-curl -sL "$SINGBOX_URL" -o "$STMP/sing-box.tar.gz" || \
-    die "Не удалось скачать sing-box." "Проверьте интернет и повторите."
+# -f: без него curl сохраняет HTML-страницу ошибки как .tar.gz, и падает уже tar
+# с невнятным сообщением. Плюс повторы — канал бывает нестабильным.
+DL_OK=false
+for attempt in 1 2 3; do
+    if curl -fsSL --max-time 180 "$SINGBOX_URL" -o "$STMP/sing-box.tar.gz"; then
+        DL_OK=true; break
+    fi
+    warn "Загрузка не удалась (попытка $attempt из 3) — повторяю через 3 сек..."
+    sleep 3
+done
+if ! $DL_OK; then
+    rm -rf "$STMP"
+    die "Не удалось скачать sing-box (3 попытки)." \
+        "URL: $SINGBOX_URL — проверьте его вручную:  curl -I $SINGBOX_URL"
+fi
 tar xzf "$STMP/sing-box.tar.gz" -C "$STMP" || \
     die "Архив sing-box повреждён/не подошёл под архитектуру ${SB_ARCH}." "Повторите запуск."
 install -m 755 "$STMP/sing-box-${SINGBOX_VERSION}-linux-${SB_ARCH}/sing-box" /usr/local/bin/sing-box

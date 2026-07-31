@@ -20,7 +20,7 @@ DHCP_TO="${LAN_SUBNET}.200"
 SINGBOX_PORT=7893         # TProxy inbound (sing-box)
 SERVER_PORT=8000
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TOTAL_STEPS=8
+TOTAL_STEPS=9
 
 # ── Вспомогательные функции ───────────────────────────────────────────────────
 step() { echo -e "\n${W}[$1/$TOTAL_STEPS] $2${N}"; }
@@ -70,7 +70,58 @@ fi
 ok "Интернет доступен"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-step 2 "Определение сетевых интерфейсов"
+step 2 "Запрет сна — коробка работает как роутер, крышка может быть закрыта"
+# ═══════════════════════════════════════════════════════════════════════════════
+# Ноутбук в этой роли обязан работать всегда, вне зависимости от закрытой
+# крышки и простоя. Дефолт systemd на закрытие крышки — suspend, что убивает
+# раздачу для всех устройств роутера разом. Фиксим на двух уровнях: systemd-
+# logind (действует всегда) и GNOME power-plugin (если есть графическая сессия).
+
+info "systemd-logind: игнорировать закрытие крышки и простой..."
+mkdir -p /etc/systemd/logind.conf.d
+cat > /etc/systemd/logind.conf.d/99-jackalrouter-no-sleep.conf << 'EOF'
+[Login]
+HandleLidSwitch=ignore
+HandleLidSwitchDocked=ignore
+HandleLidSwitchExternalPower=ignore
+IdleAction=ignore
+EOF
+systemctl restart systemd-logind
+ok "Крышка/простой больше не усыпляют систему"
+
+info "Блокирую sleep/suspend/hibernate на уровне systemd..."
+systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target 2>/dev/null || true
+ok "sleep-таргеты замаскированы — в спящий режим не уйдёт, даже если что-то попросит"
+
+if command -v gsettings >/dev/null 2>&1; then
+    JR_USER=$(logname 2>/dev/null || echo "${SUDO_USER:-}")
+    JR_UID=$(id -u "$JR_USER" 2>/dev/null || true)
+    if [ -n "$JR_USER" ] && [ -n "$JR_UID" ] && [ -S "/run/user/$JR_UID/bus" ]; then
+        info "GNOME power-настройки для $JR_USER: отключаю автосон..."
+        for kv in \
+            "org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type nothing" \
+            "org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type nothing" \
+            "org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout 0" \
+            "org.gnome.settings-daemon.plugins.power sleep-inactive-battery-timeout 0" \
+            "org.gnome.desktop.session idle-delay 0"
+        do
+            schema=$(echo "$kv" | awk '{print $1}')
+            key=$(echo "$kv" | awk '{print $2}')
+            val=$(echo "$kv" | cut -d' ' -f3-)
+            sudo -u "$JR_USER" env XDG_RUNTIME_DIR="/run/user/$JR_UID" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$JR_UID/bus" \
+                gsettings set "$schema" "$key" "$val" 2>/dev/null || true
+        done
+        ok "GNOME автосон отключён для $JR_USER"
+    else
+        info "Графической сессии не видно (сервер/безголовая система) — GNOME-настройки пропущены"
+    fi
+else
+    info "gsettings нет — GNOME отсутствует, пропускаю (systemd-уровня фикса достаточно)"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+step 3 "Определение сетевых интерфейсов"
 # ═══════════════════════════════════════════════════════════════════════════════
 
 info "Ищу интерфейс с выходом в интернет..."
@@ -141,7 +192,7 @@ sed -i "s/INT_IFACE *= *\"[^\"]*\"/INT_IFACE    = \"$LAN_IFACE\"/" "$SCRIPT_DIR/
 ok "Интерфейс $LAN_IFACE записан в server.py"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-step 3 "Обновление системы и установка пакетов"
+step 4 "Обновление системы и установка пакетов"
 # ═══════════════════════════════════════════════════════════════════════════════
 
 info "Обновляю список пакетов..."
@@ -186,7 +237,7 @@ if systemctl is-active redsocks -q 2>/dev/null; then
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
-step 4 "Настройка сети — статический IP на $LAN_IFACE"
+step 5 "Настройка сети — статический IP на $LAN_IFACE"
 # ═══════════════════════════════════════════════════════════════════════════════
 
 info "Назначаю статический IP ${LAN_IP}/24 на интерфейс $LAN_IFACE..."
@@ -207,7 +258,7 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
-step 5 "Настройка DHCP-сервера для роутера"
+step 6 "Настройка DHCP-сервера для роутера"
 # ═══════════════════════════════════════════════════════════════════════════════
 
 info "Настраиваю dnsmasq (DHCP + DNS-форвардинг на 8.8.8.8)..."
@@ -250,7 +301,7 @@ systemctl restart dnsmasq || die \
 ok "DHCP-сервер запущен"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-step 6 "Настройка iptables — TProxy маршрутизация и защита от утечек"
+step 7 "Настройка iptables — TProxy маршрутизация и защита от утечек"
 # ═══════════════════════════════════════════════════════════════════════════════
 
 info "Включаю IP forwarding..."
@@ -267,6 +318,32 @@ ip rule add fwmark 1 table 100
 ip route del local default dev lo table 100 2>/dev/null || true
 ip route add local default dev lo table 100
 ok "Policy routing: fwmark 1 → таблица 100 (локальная доставка)"
+
+# ── ВАЖНО: сделать policy routing постоянным ─────────────────────────────────
+# netfilter-persistent сохраняет ТОЛЬКО iptables. Правила "ip rule"/"ip route"
+# после перезагрузки исчезают, и тогда TPROXY метит пакеты меткой 1, а доставить
+# их локально ядру нечем — трафик клиентов молча пропадает. Снаружи это выглядит
+# как "раздаётся, DHCP выдаёт адрес, но интернета нет". Поэтому вешаем oneshot-
+# юнит, который восстанавливает их при каждой загрузке до старта sing-box.
+info "Делаю policy routing постоянным (переживёт перезагрузку)..."
+cat > /etc/systemd/system/jackal-policy-routing.service << 'EOF'
+[Unit]
+Description=JackalRouter: policy routing for TProxy (fwmark 1 -> table 100)
+After=network-online.target
+Wants=network-online.target
+Before=sing-box.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'ip rule add fwmark 1 table 100 2>/dev/null; ip route add local default dev lo table 100 2>/dev/null; exit 0'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable jackal-policy-routing -q 2>/dev/null || warn "Не удалось включить автозапуск policy routing"
+ok "Policy routing восстанавливается при загрузке (jackal-policy-routing.service)"
 
 # ── Убираем старые redsocks-правила в nat (если остались) ────────────────────
 iptables -t nat -D PREROUTING -i "$LAN_IFACE" -p tcp -j REDSOCKS 2>/dev/null || true
@@ -305,16 +382,24 @@ ok "TProxy: весь UDP+TCP → sing-box :$SINGBOX_PORT  (QUIC через пр�
 
 # ── MASQUERADE + FORWARD ──────────────────────────────────────────────────────
 info "Настраиваю MASQUERADE и FORWARD..."
+# WAN-сторона намеренно НЕ привязана к имени интерфейса (! -o LAN_IFACE, а не
+# -o WAN_IFACE): если интернет-адаптер сменится (переключение Wi-Fi сети,
+# другой кабель/донгл, смена имени интерфейса) — правила не придётся
+# переприменять, всё, что не в LAN, продолжит маскироваться автоматически.
 iptables -t nat -D POSTROUTING -o "$WAN_IFACE" -j MASQUERADE 2>/dev/null || true
-iptables -t nat -A POSTROUTING -o "$WAN_IFACE" -j MASQUERADE
+iptables -t nat -C POSTROUTING ! -o "$LAN_IFACE" -j MASQUERADE 2>/dev/null \
+    || iptables -t nat -A POSTROUTING ! -o "$LAN_IFACE" -j MASQUERADE
 
 iptables -D FORWARD -i "$LAN_IFACE" -o "$WAN_IFACE" -j ACCEPT 2>/dev/null || true
 iptables -D FORWARD -i "$WAN_IFACE" -o "$LAN_IFACE" \
     -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-iptables -A FORWARD -i "$LAN_IFACE" -o "$WAN_IFACE" -j ACCEPT
-iptables -A FORWARD -i "$WAN_IFACE" -o "$LAN_IFACE" \
+iptables -C FORWARD -i "$LAN_IFACE" ! -o "$LAN_IFACE" -j ACCEPT 2>/dev/null \
+    || iptables -A FORWARD -i "$LAN_IFACE" ! -o "$LAN_IFACE" -j ACCEPT
+iptables -C FORWARD ! -i "$LAN_IFACE" -o "$LAN_IFACE" \
+    -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+    || iptables -A FORWARD ! -i "$LAN_IFACE" -o "$LAN_IFACE" \
     -m state --state RELATED,ESTABLISHED -j ACCEPT
-ok "MASQUERADE + FORWARD: $LAN_IFACE ↔ $WAN_IFACE"
+ok "MASQUERADE + FORWARD настроены (переживут смену WAN-сети/адаптера)"
 
 # ── IPv6 Leak Prevention ──────────────────────────────────────────────────────
 info "Блокирую IPv6 из LAN..."
@@ -338,7 +423,7 @@ netfilter-persistent save -q 2>/dev/null \
 ok "Правила сохранены (переживут перезагрузку)"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-step 7 "Установка sing-box и JackalRouter"
+step 8 "Установка sing-box и JackalRouter"
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ── sing-box ──────────────────────────────────────────────────────────────────
@@ -351,8 +436,21 @@ ok "sing-box v${SINGBOX_VERSION}"
 info "Скачиваю sing-box..."
 STMP=$(mktemp -d)
 SINGBOX_URL="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
-curl -sL "$SINGBOX_URL" -o "$STMP/sing-box.tar.gz" || \
-    die "Не удалось скачать sing-box." "Проверьте интернет и повторите."
+# -f: без него curl сохраняет HTML-страницу ошибки как .tar.gz, и падает уже tar
+# с невнятным сообщением. Плюс повторы — канал бывает нестабильным.
+DL_OK=false
+for attempt in 1 2 3; do
+    if curl -fsSL --max-time 180 "$SINGBOX_URL" -o "$STMP/sing-box.tar.gz"; then
+        DL_OK=true; break
+    fi
+    warn "Загрузка не удалась (попытка $attempt из 3) — повторяю через 3 сек..."
+    sleep 3
+done
+if ! $DL_OK; then
+    rm -rf "$STMP"
+    die "Не удалось скачать sing-box (3 попытки)." \
+        "URL: $SINGBOX_URL — проверьте его вручную:  curl -I $SINGBOX_URL"
+fi
 tar xzf "$STMP/sing-box.tar.gz" -C "$STMP"
 install -m 755 "$STMP/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box
 rm -rf "$STMP"
@@ -432,7 +530,7 @@ systemctl enable jackalrouter -q
 ok "Сервис зарегистрирован (автозапуск при старте системы)"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-step 8 "Запуск и проверка всех сервисов"
+step 9 "Запуск и проверка всех сервисов"
 # ═══════════════════════════════════════════════════════════════════════════════
 
 info "Запускаю sing-box..."

@@ -11,6 +11,7 @@ import re
 import os
 import socket
 import ssl
+import struct
 import time
 import logging
 import ipaddress
@@ -68,7 +69,68 @@ def _is_ip_literal(value: str) -> bool:
         return False
 
 
-def make_singbox_conf(ip: str, port: int, user: str, password: str) -> dict:
+def check_udp_associate(ip: str, port: int, user: str, password: str,
+                        timeout: int = 6) -> bool:
+    """Проверяет, поддерживает ли апстрим-прокси SOCKS5 UDP ASSOCIATE.
+
+    Обнаружено на живой коробке: часть мобильных/резидентных прокси отклоняет
+    команду ASSOCIATE кодом 7 ("Command not supported"). Без этой проверки
+    sing-box всё равно пытается пускать QUIC через такой прокси — relay
+    падает, и TPROXY молча роняет пакеты. С точки зрения телефона это выглядит
+    как "сайты не открываются": браузер зависает в ожидании QUIC-хендшейка
+    вместо мгновенного отката на TCP. Результат идёт в make_singbox_conf(),
+    чтобы либо разрешить QUIC через прокси (когда реально работает — не
+    роняет fraud-score резидентного IP), либо явно заблокировать его (когда
+    прокси всё равно не может его релеить — быстрый и чистый отказ лучше
+    тихого зависания)."""
+    t = u = None
+    try:
+        t = socket.create_connection((ip, port), timeout=timeout)
+        t.settimeout(timeout)
+        has_auth = bool(user and password)
+        methods = b"\x02" if has_auth else b"\x00"
+        t.sendall(b"\x05" + bytes([len(methods)]) + methods)
+        resp = t.recv(2)
+        if len(resp) < 2 or resp[0] != 5 or resp[1] == 0xFF:
+            return False
+        if resp[1] == 2:
+            uu, pp = user.encode(), password.encode()
+            t.sendall(b"\x01" + bytes([len(uu)]) + uu + bytes([len(pp)]) + pp)
+            resp = t.recv(2)
+            if len(resp) < 2 or resp[1] != 0:
+                return False
+        t.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
+        resp = t.recv(10)
+        if len(resp) < 10 or resp[1] != 0:
+            return False  # code=7 (Command not supported) и подобные — сюда
+        bnd_ip = socket.inet_ntoa(resp[4:8])
+        bnd_port = struct.unpack("!H", resp[8:10])[0]
+        if bnd_ip in ("0.0.0.0", "127.0.0.1"):
+            bnd_ip = ip
+        dns = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+        for part in b"example.com".split(b"."):
+            dns += bytes([len(part)]) + part
+        dns += b"\x00\x00\x01\x00\x01"
+        pkt = b"\x00\x00\x00\x01" + socket.inet_aton("8.8.8.8") \
+            + struct.pack("!H", 53) + dns
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        u.settimeout(timeout)
+        u.sendto(pkt, (bnd_ip, bnd_port))
+        data, _ = u.recvfrom(2048)
+        return len(data) > 10
+    except Exception:
+        return False
+    finally:
+        for sk in (u, t):
+            try:
+                if sk:
+                    sk.close()
+            except Exception:
+                pass
+
+
+def make_singbox_conf(ip: str, port: int, user: str, password: str,
+                      udp_supported: bool = True) -> dict:
     # Адрес прокси часто задают доменом (например geo.iproyal.com). Такой домен
     # НЕЛЬЗЯ резолвить через сам прокси: чтобы подключиться к прокси, надо
     # сначала узнать его адрес, а чтобы узнать адрес — надо подключиться к
@@ -99,8 +161,14 @@ def make_singbox_conf(ip: str, port: int, user: str, password: str) -> dict:
     route_rules = [
         {"action": "sniff"},
         {"protocol": "dns", "action": "hijack-dns"},
-        {"ip_is_private": True, "outbound": "direct"},
     ]
+    if not udp_supported:
+        # Апстрим не умеет UDP ASSOCIATE (проверено check_udp_associate перед
+        # вызовом) — блокируем QUIC ЯВНО, до попытки релея через прокси.
+        # Иначе TPROXY тихо роняет пакеты, и устройства зависают в ожидании
+        # QUIC вместо мгновенного отката на TCP/HTTP2.
+        route_rules.append({"protocol": "quic", "outbound": "block"})
+    route_rules.append({"ip_is_private": True, "outbound": "direct"})
     if proxy_is_domain:
         # Трафик к самому прокси не должен заворачиваться в прокси.
         route_rules.append({"domain": [ip], "outbound": "direct"})
@@ -111,6 +179,22 @@ def make_singbox_conf(ip: str, port: int, user: str, password: str) -> dict:
         {"domain": ["dns.google", "one.one.one.one", "cloudflare-dns.com", "doh.pub", "doh.360.cn"], "outbound": "block"},
         {"port": 853, "outbound": "block"},
     ]
+    # ВАЖНО, проверено на живой коробке: SOCKS5 умеет принимать домен нативно
+    # (ATYP=domain), и sing-box по умолчанию просто передаёт домен прокси как
+    # есть — резолвит его САМ ПРОКСИ, на своей стороне. У части провайдеров
+    # (особенно резидентных/мобильных) инфраструктура, которая резолвит домены,
+    # топологически НЕ совпадает с точкой выхода трафика: реальные HTTP(S)-
+    # соединения уходили корректно через residential-exit (США), а тест
+    # определения DNS-резолвера показывал совсем другую страну. "domain_strategy"
+    # на самом outbound здесь НЕ помогает — по документированному поведению
+    # sing-box он не действует для протоколов, которые умеют резолвить домены
+    # сами (SOCKS5 — из их числа); проверено эмпирически, эффекта не было.
+    # Рабочий способ — явный "resolve" ПОСЛЕДНИМ правилом: резолвит домен ДО
+    # выбора аутбаунда (через default_domain_resolver, то есть тем же прокси-
+    # туннелем, но уже IP-запросом на 8.8.8.8, а не доменным ATYP), и до прокси
+    # долетает уже готовый IP. Стоит последним, чтобы все правила выше
+    # (direct/block по домену) успели отработать на оригинальном домене.
+    route_rules.append({"action": "resolve", "strategy": "ipv4_only"})
 
     socks_out = {
         "type": "socks",
@@ -120,6 +204,11 @@ def make_singbox_conf(ip: str, port: int, user: str, password: str) -> dict:
         "version": "5",
         "username": user,
         "password": password,
+        # ПРИМЕЧАНИЕ: "domain_strategy" тут намеренно НЕ ставим — проверено
+        # эмпирически на живой коробке, что для SOCKS5 (умеет ATYP=domain
+        # нативно) это поле не действует и никак не влияет на резолв домена.
+        # Настоящий фикс той же проблемы — правило "resolve" в route.rules
+        # (см. ниже), которое резолвит домен ДО выбора аутбаунда.
     }
     if proxy_is_domain:
         # Тот самый рабочий фикс: адрес самого прокси резолвим напрямую,
@@ -167,12 +256,13 @@ def make_singbox_conf(ip: str, port: int, user: str, password: str) -> dict:
     }
 
 
-def write_singbox_conf(ip: str, port: int, user: str, password: str):
+def write_singbox_conf(ip: str, port: int, user: str, password: str,
+                       udp_supported: bool = True):
     os.makedirs(os.path.dirname(SINGBOX_CONF), exist_ok=True)
-    conf = make_singbox_conf(ip, port, user, password)
+    conf = make_singbox_conf(ip, port, user, password, udp_supported=udp_supported)
     with open(SINGBOX_CONF, "w") as f:
         json.dump(conf, f, indent=2)
-    log.info(f"Записан {SINGBOX_CONF}  [{ip}:{port}]")
+    log.info(f"Записан {SINGBOX_CONF}  [{ip}:{port}]  udp_supported={udp_supported}")
 
 
 # ── iptables (TProxy) ─────────────────────────────────────────────────────────
@@ -449,9 +539,15 @@ async def set_proxy(req: ProxyRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
     try:
+        log.info("Проверяю поддержку UDP ASSOCIATE у прокси перед применением…")
+        udp_ok = check_udp_associate(proxy["ip"], proxy["port"],
+                                     proxy["user"], proxy["password"])
+        log.info(f"UDP ASSOCIATE: {'поддерживается' if udp_ok else 'НЕ поддерживается — QUIC будет заблокирован явно'}")
+
         write_singbox_conf(
             ip=proxy["ip"], port=proxy["port"],
             user=proxy["user"], password=proxy["password"],
+            udp_supported=udp_ok,
         )
         code, _, err = run("systemctl restart sing-box")
         if code != 0:
@@ -461,6 +557,7 @@ async def set_proxy(req: ProxyRequest):
             "status": "ok",
             "message": "Прокси применён, sing-box перезапущен.",
             "proxy": f"{proxy['ip']}:{proxy['port']}",
+            "udp_supported": udp_ok,
         }
     except Exception as e:
         log.error(f"Ошибка применения прокси: {e}")

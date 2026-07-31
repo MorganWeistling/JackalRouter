@@ -33,6 +33,11 @@ except ImportError:
 
 SERVER_PORT  = 8000
 TIMEOUT      = 15
+# Cloudflare — держит QUIC/HTTP3 на 443 на фиксированном IP (не нужен доп.
+# DNS-резолв в теле SOCKS5 UDP-релея). Используется только для проверки
+# QUIC-пробы, к реальному трафику пользователя отношения не имеет.
+QUIC_TARGET_IP   = "1.1.1.1"
+QUIC_TARGET_PORT = 443
 
 # Каталог для файлов состояния (история прокси, последний IP сервера).
 # В собранном PyInstaller --onefile .exe __file__ указывает на временную
@@ -160,6 +165,102 @@ def socks5_udp_check(host: str, port: int, user: str, password: str,
                 pass
 
 
+def quic_udp_check(host: str, port: int, user: str, password: str,
+                   timeout: int = 10) -> tuple:
+    """Проверяет QUIC именно на порту 443 (реальный порт QUIC-трафика с
+    устройств), а не на 53 как socks5_udp_check. Некоторые прокси-провайдеры
+    режут UDP выборочно по порту (DNS/53 разрешают, высоконагруженный 443 —
+    нет), и тогда "UDP работает" по DNS-тесту было бы ложноположительным.
+
+    Шлём QUIC Initial-пакет с заведомо неподдерживаемой ("greased", см.
+    RFC 9000 §15) версией 0x1a2a3a4a на 1.1.1.1:443 (Cloudflare, всегда
+    поднят QUIC/HTTP3). Любой сервер, поддерживающий QUIC, обязан ответить
+    Version Negotiation пакетом (version=0) — даже не пытаясь провести
+    хендшейк, поэтому этого достаточно как честного теста доходимости порта,
+    без реализации полного QUIC-стека."""
+    t = u = None
+    try:
+        t = socket.create_connection((host, port), timeout=timeout)
+        t.settimeout(timeout)
+        has_auth = bool(user and password)
+        methods = b"\x02" if has_auth else b"\x00"
+        t.sendall(b"\x05" + bytes([len(methods)]) + methods)
+        resp = t.recv(2)
+        if len(resp) < 2 or resp[0] != 5:
+            return False, "invalid SOCKS5 response"
+        if resp[1] == 0xFF:
+            return False, "proxy refused auth methods"
+        if resp[1] == 2:
+            uu, pp = user.encode(), password.encode()
+            t.sendall(b"\x01" + bytes([len(uu)]) + uu + bytes([len(pp)]) + pp)
+            resp = t.recv(2)
+            if len(resp) < 2 or resp[1] != 0:
+                return False, "authentication failed (wrong login/password)"
+        t.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
+        resp = t.recv(10)
+        if len(resp) < 10 or resp[1] != 0:
+            return False, "UDP ASSOCIATE rejected by proxy"
+        bnd_ip = socket.inet_ntoa(resp[4:8])
+        bnd_port = struct.unpack("!H", resp[8:10])[0]
+        if bnd_ip in ("0.0.0.0", "127.0.0.1"):
+            bnd_ip = host
+
+        # Минимальный QUIC long-header пакет: form=1, fixed=1, type=Initial(00).
+        # Token/Length/Packet Number можно не добавлять — сервер отклоняет
+        # пакет по неизвестной версии ДО попытки разобрать остальное тело.
+        dcid, scid = os.urandom(8), os.urandom(8)
+        quic_pkt = bytes([0xC0]) + struct.pack("!I", 0x1A2A3A4A) \
+            + bytes([len(dcid)]) + dcid + bytes([len(scid)]) + scid
+        # RFC 9000 §14.1: датаграмму с Initial клиент обязан набить минимум
+        # до 1200 байт — часть серверов молча дропает более короткие пакеты
+        # как защиту от amplification-атак, и тест ложно провалится.
+        if len(quic_pkt) < 1200:
+            quic_pkt += b"\x00" * (1200 - len(quic_pkt))
+
+        pkt = b"\x00\x00\x00\x01" + socket.inet_aton(QUIC_TARGET_IP) \
+            + struct.pack("!H", QUIC_TARGET_PORT) + quic_pkt
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        u.settimeout(timeout)
+        u.sendto(pkt, (bnd_ip, bnd_port))
+        data, _ = u.recvfrom(2048)
+
+        # Снимаем SOCKS5 UDP-релей заголовок (RFC 1928 §7): RSV(2) FRAG(1)
+        # ATYP(1) ADDR(var) PORT(2), дальше — сырые байты от QUIC-сервера.
+        if len(data) < 10:
+            return False, "empty/short UDP response"
+        atyp = data[3]
+        if atyp == 1:
+            payload = data[10:]
+        elif atyp == 4:
+            payload = data[22:]
+        elif atyp == 3:
+            payload = data[5 + data[4] + 2:]
+        else:
+            return False, f"unknown SOCKS5 ATYP in reply ({atyp})"
+
+        if len(payload) < 5:
+            return False, "response too short to be a QUIC packet"
+        if (payload[0] & 0x80) == 0:
+            return False, "response is not a QUIC long-header packet"
+        resp_version = struct.unpack("!I", payload[1:5])[0]
+        if resp_version != 0:
+            return False, f"unexpected QUIC version 0x{resp_version:08x} (expected Version Negotiation)"
+        return True, "ok"
+    except socket.timeout:
+        return False, "no response on port 443 (UDP ASSOCIATE works, but 443 seems filtered)"
+    except ConnectionRefusedError:
+        return False, "connection refused"
+    except OSError as e:
+        return False, str(e)
+    finally:
+        for sk in (u, t):
+            try:
+                if sk:
+                    sk.close()
+            except Exception:
+                pass
+
+
 def measure_speed(proxies: dict) -> tuple:
     """Качает SPEED_BYTES через прокси, возвращает (mbps, kb_per_s, latency_ms)
     или (None, None, None) при ошибке."""
@@ -252,11 +353,16 @@ S = {
         "chk_st_fail":    "Прокси не работает ✗",
         "udp_checking":   "Проверяю UDP…",
         "udp_start":      "Проверяю UDP ASSOCIATE через {}:{} …",
-        "udp_ok":         "✓ UDP работает  |  прокси поддерживает UDP ASSOCIATE — QUIC пойдёт через прокси",
-        "udp_fail":       "✗ UDP не поддерживается: {}",
+        "udp_assoc_ok":   "✓ UDP ASSOCIATE работает (DNS :53 через релей)",
+        "udp_fail":       "✗ UDP ASSOCIATE не поддерживается: {}",
         "udp_note":       "   › QUIC будет заблокирован (DROP). Это повышает fraud-score антидетектов.",
-        "udp_st_ok":      "UDP работает ✓",
+        "quic_start":     "Проверяю QUIC на порту 443 (реальный порт QUIC-трафика с устройств)…",
+        "quic_ok":        "✓ QUIC/443 отвечает  |  реальный QUIC-трафик с устройств пойдёт через прокси",
+        "quic_fail":      "✗ QUIC/443 не отвечает: {}",
+        "quic_note":      "   › UDP в целом работает, но порт 443 у прокси похоже фильтруется отдельно — реальный QUIC с устройств может не проходить, хотя DNS-релей работал.",
+        "udp_st_ok":      "UDP + QUIC работают ✓",
         "udp_st_fail":    "UDP не работает ✗",
+        "udp_st_quic_fail": "UDP есть, QUIC/443 — нет ⚠",
         "btn_clean":      "⬡  Проверить чистоту",
         "clean_checking": "Проверяю чистоту и скорость…",
         "clean_start":    "Проверяю чистоту/скорость через {}:{} …",
@@ -362,11 +468,16 @@ S = {
         "chk_st_fail":    "Proxy failed ✗",
         "udp_checking":   "Checking UDP…",
         "udp_start":      "Checking UDP ASSOCIATE via {}:{} …",
-        "udp_ok":         "✓ UDP works  |  proxy supports UDP ASSOCIATE — QUIC will go through proxy",
-        "udp_fail":       "✗ UDP not supported: {}",
+        "udp_assoc_ok":   "✓ UDP ASSOCIATE works (DNS :53 via relay)",
+        "udp_fail":       "✗ UDP ASSOCIATE not supported: {}",
         "udp_note":       "   › QUIC will be blocked (DROP). This raises antidetect fraud-score.",
-        "udp_st_ok":      "UDP works ✓",
+        "quic_start":     "Checking QUIC on port 443 (the real port devices use for QUIC)…",
+        "quic_ok":        "✓ QUIC/443 responds  |  real QUIC traffic from devices will go through the proxy",
+        "quic_fail":      "✗ QUIC/443 not responding: {}",
+        "quic_note":      "   › UDP works in general, but port 443 seems filtered separately by the proxy — real QUIC from devices may not get through, even though the DNS relay worked.",
+        "udp_st_ok":      "UDP + QUIC work ✓",
         "udp_st_fail":    "UDP failed ✗",
+        "udp_st_quic_fail": "UDP works, QUIC/443 doesn't ⚠",
         "btn_clean":      "⬡  Check cleanliness",
         "clean_checking": "Checking cleanliness & speed…",
         "clean_start":    "Checking cleanliness/speed via {}:{} …",
@@ -1059,11 +1170,22 @@ class App:
         threading.Thread(target=self._udp_check, args=(p,), daemon=True).start()
 
     def _udp_check(self, p: dict):
+        # Шаг 1: UDP ASSOCIATE вообще работает? (DNS/53 — простой, быстрый тест)
         ok, reason = socks5_udp_check(p["ip"], p["port"], p["user"], p["password"])
-        if ok:
-            self.root.after(0, self._on_udp_ok, self._("udp_ok"))
-        else:
+        if not ok:
             self.root.after(0, self._on_udp_fail, self._("udp_fail", reason))
+            return
+        self.root.after(0, self._log, self._("udp_assoc_ok"), "ok")
+        self.root.after(0, self._log, self._("quic_start"), "info")
+
+        # Шаг 2: а порт 443 — тот самый, которым реально пользуется QUIC с
+        # устройств — не режется ли у прокси отдельно от DNS? Без этого шага
+        # тест 1 сам по себе может дать ложноположительный "QUIC работает".
+        qok, qreason = quic_udp_check(p["ip"], p["port"], p["user"], p["password"])
+        if qok:
+            self.root.after(0, self._on_udp_ok, self._("quic_ok"))
+        else:
+            self.root.after(0, self._on_quic_fail, self._("quic_fail", qreason))
 
     def _on_udp_ok(self, msg: str):
         self._log(msg, "ok")
@@ -1074,6 +1196,15 @@ class App:
         self._log(msg, "err")
         self._log(self._("udp_note"), "warn")
         self._status(self._("udp_st_fail"), self.RED)
+        self._set_buttons(True)
+
+    def _on_quic_fail(self, msg: str):
+        """UDP ASSOCIATE в целом работает, но именно порт 443 (реальный порт
+        QUIC) не отвечает — типично для прокси, которые режут UDP выборочно
+        по порту. Отдельный статус, чтобы не путать с полным отказом UDP."""
+        self._log(msg, "err")
+        self._log(self._("quic_note"), "warn")
+        self._status(self._("udp_st_quic_fail"), self.YELLOW)
         self._set_buttons(True)
 
     # ── Проверка чистоты (репутация + скорость) ────────────────────────────────

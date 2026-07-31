@@ -51,3 +51,6 @@ client/proxy_history.json
 client/build/
 client/dist/
 client/*.spec
+
+# Scratch / debug artifacts (screenshots, temp diagnostic files)
+.scratch/

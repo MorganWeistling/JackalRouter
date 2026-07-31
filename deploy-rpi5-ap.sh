@@ -237,11 +237,28 @@ Restart=on-failure
 RestartSec=5s
 EOF
 systemctl daemon-reload
-systemctl enable dnsmasq -q 2>/dev/null || true
-ok "dnsmasq устойчив к порядку загрузки (переживает ребут)"
 
-systemctl restart dnsmasq || warn "dnsmasq пока не стартовал (ждёт wlan0) — поднимется автоматически."
-ok "DHCP-сервер настроен"
+# ── Кто раздаёт DHCP: наш dnsmasq или NetworkManager? ────────────────────────
+# NetworkManager в режиме точки доступа переводит соединение в ipv4.method=shared
+# и поднимает СВОЙ dnsmasq на ${LAN_IP}:53, даже если в профиле явно стоит
+# ipv4.method manual. Наш системный тогда не может занять порт, падает с
+# "Address already in use", а Restart=on-failure крутит его бесконечно (на
+# живой коробке в похожей ситуации досчитало до 402 перезапусков подряд).
+# Драться за порт бессмысленно: DHCP от NM работает, а утечку DNS мы всё равно
+# закрываем правилами TPROXY для :53 в следующем шаге — независимо от того,
+# чей dnsmasq реально раздаёт.
+sleep 2
+if pgrep -f "dnsmasq.*${LAN_IFACE}" >/dev/null 2>&1; then
+    systemctl disable dnsmasq -q 2>/dev/null || true
+    systemctl stop dnsmasq 2>/dev/null || true
+    ok "DHCP раздаёт NetworkManager (его dnsmasq) — свой отключил, чтобы не конфликтовал"
+    info "Клиенты получат DNS $LAN_IP, но запросы принудительно уходят в sing-box (следующий шаг)"
+else
+    systemctl enable dnsmasq -q 2>/dev/null || true
+    systemctl restart dnsmasq 2>/dev/null \
+        || warn "dnsmasq пока не стартовал (ждёт $LAN_IFACE) — поднимется автоматически."
+    ok "DHCP раздаёт наш dnsmasq (диапазон ${DHCP_FROM}–${DHCP_TO})"
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 step 6 "iptables — TProxy маршрутизация и защита от утечек"
@@ -261,6 +278,32 @@ ip route del local default dev lo table 100 2>/dev/null || true
 ip route add local default dev lo table 100
 ok "fwmark 1 → таблица 100"
 
+# ── ВАЖНО: сделать policy routing постоянным ─────────────────────────────────
+# netfilter-persistent сохраняет ТОЛЬКО iptables. Правила "ip rule"/"ip route"
+# после перезагрузки исчезают, и тогда TPROXY метит пакеты меткой 1, а доставить
+# их локально ядру нечем — трафик клиентов молча пропадает. Снаружи это выглядит
+# как "раздаётся, DHCP выдаёт адрес, но интернета нет". Поэтому вешаем oneshot-
+# юнит, который восстанавливает их при каждой загрузке до старта sing-box.
+info "Делаю policy routing постоянным (переживёт перезагрузку)..."
+cat > /etc/systemd/system/jackal-policy-routing.service << 'EOF'
+[Unit]
+Description=JackalRouter: policy routing for TProxy (fwmark 1 -> table 100)
+After=network-online.target
+Wants=network-online.target
+Before=sing-box.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'ip rule add fwmark 1 table 100 2>/dev/null; ip route add local default dev lo table 100 2>/dev/null; exit 0'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable jackal-policy-routing -q 2>/dev/null || warn "Не удалось включить автозапуск policy routing"
+ok "Policy routing восстанавливается при загрузке (jackal-policy-routing.service)"
+
 info "MSS clamp 1280 на $LAN_IFACE..."
 iptables -t mangle -D PREROUTING -i "$LAN_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1280 2>/dev/null || true
 iptables -t mangle -A PREROUTING -i "$LAN_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1280
@@ -271,6 +314,13 @@ ok "MSS clamp 1280 — ingress + egress"
 info "TProxy цепочка SING_BOX..."
 iptables -t mangle -N SING_BOX 2>/dev/null || true
 iptables -t mangle -F SING_BOX
+# DNS клиентов перехватываем ПЕРВЫМ делом — до RETURN'ов для приватных сетей.
+# NetworkManager в режиме shared может выдавать клиентам DNS = $LAN_IP (сам
+# себя). Без этих двух правил такие запросы попадают под "-d 10.0.0.0/8 -j
+# RETURN" ниже, уходят мимо sing-box и резолвятся напрямую — то есть DNS течёт
+# в обход прокси. Проверено на живой коробке в похожей топологии.
+iptables -t mangle -A SING_BOX -p udp --dport 53 -j TPROXY --on-port "$SINGBOX_PORT" --tproxy-mark 1
+iptables -t mangle -A SING_BOX -p tcp --dport 53 -j TPROXY --on-port "$SINGBOX_PORT" --tproxy-mark 1
 for net in 0.0.0.0/8 10.0.0.0/8 127.0.0.0/8 169.254.0.0/16 \
            172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
     iptables -t mangle -A SING_BOX -d "$net" -j RETURN
@@ -281,14 +331,20 @@ iptables -t mangle -D PREROUTING -i "$LAN_IFACE" -j SING_BOX 2>/dev/null || true
 iptables -t mangle -A PREROUTING -i "$LAN_IFACE" -j SING_BOX
 ok "TProxy: весь UDP+TCP с Wi-Fi → sing-box :$SINGBOX_PORT (QUIC через прокси, FakeIP)"
 
-info "MASQUERADE и FORWARD ($LAN_IFACE ↔ $WAN_IFACE)..."
+info "MASQUERADE и FORWARD ($LAN_IFACE ↔ любой выход в интернет)..."
+# WAN-сторона намеренно НЕ привязана к имени интерфейса (! -o LAN_IFACE, а не
+# -o WAN_IFACE): если интернет-адаптер сменится (кабель на другой порт, смена
+# имени интерфейса) — правила не придётся переприменять.
 iptables -t nat -D POSTROUTING -o "$WAN_IFACE" -j MASQUERADE 2>/dev/null || true
-iptables -t nat -A POSTROUTING -o "$WAN_IFACE" -j MASQUERADE
+iptables -t nat -C POSTROUTING ! -o "$LAN_IFACE" -j MASQUERADE 2>/dev/null \
+    || iptables -t nat -A POSTROUTING ! -o "$LAN_IFACE" -j MASQUERADE
 iptables -D FORWARD -i "$LAN_IFACE" -o "$WAN_IFACE" -j ACCEPT 2>/dev/null || true
 iptables -D FORWARD -i "$WAN_IFACE" -o "$LAN_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-iptables -A FORWARD -i "$LAN_IFACE" -o "$WAN_IFACE" -j ACCEPT
-iptables -A FORWARD -i "$WAN_IFACE" -o "$LAN_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
-ok "MASQUERADE + FORWARD настроены"
+iptables -C FORWARD -i "$LAN_IFACE" ! -o "$LAN_IFACE" -j ACCEPT 2>/dev/null \
+    || iptables -A FORWARD -i "$LAN_IFACE" ! -o "$LAN_IFACE" -j ACCEPT
+iptables -C FORWARD ! -i "$LAN_IFACE" -o "$LAN_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+    || iptables -A FORWARD ! -i "$LAN_IFACE" -o "$LAN_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+ok "MASQUERADE + FORWARD настроены (переживут смену WAN-сети/адаптера)"
 
 info "Блокирую IPv6 из Wi-Fi..."
 ip6tables -D FORWARD -i "$LAN_IFACE" -j DROP 2>/dev/null || true
@@ -321,7 +377,21 @@ ok "sing-box v${SINGBOX_VERSION} (linux-${SB_ARCH})"
 info "Скачиваю sing-box для ${SB_ARCH}..."
 STMP=$(mktemp -d)
 SINGBOX_URL="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-${SB_ARCH}.tar.gz"
-curl -sL "$SINGBOX_URL" -o "$STMP/sing-box.tar.gz" || die "Не удалось скачать sing-box." "Проверьте интернет и повторите."
+# -f: без него curl сохраняет HTML-страницу ошибки как .tar.gz, и падает уже tar
+# с невнятным сообщением. Плюс повторы — канал бывает нестабильным.
+DL_OK=false
+for attempt in 1 2 3; do
+    if curl -fsSL --max-time 180 "$SINGBOX_URL" -o "$STMP/sing-box.tar.gz"; then
+        DL_OK=true; break
+    fi
+    warn "Загрузка не удалась (попытка $attempt из 3) — повторяю через 3 сек..."
+    sleep 3
+done
+if ! $DL_OK; then
+    rm -rf "$STMP"
+    die "Не удалось скачать sing-box (3 попытки)." \
+        "URL: $SINGBOX_URL — проверьте его вручную:  curl -I $SINGBOX_URL"
+fi
 tar xzf "$STMP/sing-box.tar.gz" -C "$STMP" || die "Архив sing-box не распаковался." "Повторите запуск."
 install -m 755 "$STMP/sing-box-${SINGBOX_VERSION}-linux-${SB_ARCH}/sing-box" /usr/local/bin/sing-box
 rm -rf "$STMP"
