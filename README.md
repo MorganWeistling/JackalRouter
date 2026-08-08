@@ -88,6 +88,8 @@ The client includes a **Check UDP** button that tests whether the upstream proxy
 | `deploy-ubuntu-wifi-ap.sh` | Ubuntu deploy — Wi-Fi #1 = WAN (reuses the already-connected network), Wi-Fi #2 = own access point (standalone router). Needs two Wi-Fi adapters. |
 | `deploy.py` | Client-side remote installer: enter server IP → check → set up NOPASSWD sudo → pick deploy type → auto copy + run over SSH |
 | `deploy.bat` / `deploy.command` | Double-click launchers for `deploy.py` (Windows / macOS) |
+| `update.py` | Updates an already-deployed box from GitHub — pulls the latest `server.py`, diffs it against what's on the box, applies it with automatic backup/health-check/rollback, and re-generates `config.json` for the currently active proxy. Does **not** touch Wi-Fi/DHCP/network settings. |
+| `update.bat` / `update.command` | Double-click launchers for `update.py` (Windows / macOS) |
 
 ### Requirements
 
@@ -190,6 +192,33 @@ The script will:
 7. Disable GRO/GSO/TSO offload on LAN interface (`ethtool`)
 8. Apply iptables TProxy rules: all TCP+UDP from LAN → sing-box port 7893
 9. Install sing-box, write FakeIP config, register and start systemd services
+
+### Updating an already-deployed box
+
+For a box that's already running (Wi-Fi/DHCP/network already configured — you don't want
+to re-answer those questions or risk breaking a working setup) but is behind on fixes:
+
+```bash
+python update.py            # Windows        (or double-click update.bat)
+python3 update.py           # macOS / Linux  (or double-click update.command on macOS)
+
+python update.py --check    # only show whether an update is available, change nothing
+```
+
+It asks for the box's IP, SSH login, and which deploy type is installed (informational —
+the corresponding script is *not* re-run, network settings are untouched). It then:
+
+1. Fetches the latest `server/server.py` from GitHub (`raw.githubusercontent.com`; falls
+   back to the local copy next to `update.py` if GitHub is unreachable)
+2. Diffs it against what's on the box, ignoring the box-specific `INT_IFACE` line
+3. If different: shows the diff, backs up the current file, applies the new one, restarts
+   `jackalrouter`, and verifies the service **and** the `/status` API respond — automatic
+   rollback to the backup if either check fails
+4. Re-generates `/etc/sing-box/config.json` for whatever proxy is *currently* configured
+   on the box (so a fix like the QUIC/DNS one takes effect immediately, not only the next
+   time someone hits **Route** in the client) and restarts `sing-box`
+5. Creates the `jackal-policy-routing` systemd unit if it's missing (older deploys didn't
+   have it — without it, policy routing for TProxy doesn't survive a reboot)
 
 ### Router configuration (one-time)
 
@@ -334,6 +363,8 @@ JackalRouter использует **SOCKS5 UDP ASSOCIATE**:
 | `deploy-ubuntu-wifi-ap.sh` | Деплой Ubuntu — Wi-Fi #1 = WAN (переиспользует уже подключённую сеть), Wi-Fi #2 = своя точка доступа (самостоятельный роутер). Нужны два Wi-Fi адаптера. |
 | `deploy.py` | Удалённый установщик с клиента: ввёл IP → проверка → NOPASSWD sudo → выбрал вид деплоя → сам копирует и запускает по SSH |
 | `deploy.bat` / `deploy.command` | Лаунчеры для двойного клика по `deploy.py` (Windows / macOS) |
+| `update.py` | Обновляет уже развёрнутую коробку с GitHub — тянет актуальный `server.py`, сверяет с тем, что на коробке, применяет с бэкапом/health-check/автооткатом и перегенерирует `config.json` под уже настроенный прокси. Wi-Fi/DHCP/сеть **не трогает**. |
+| `update.bat` / `update.command` | Лаунчеры для двойного клика по `update.py` (Windows / macOS) |
 
 ### Требования
 
@@ -438,6 +469,33 @@ sudo bash deploy-ubuntu-wifi-ap.sh   # интернет по Wi-Fi, коробк
 7. Отключение GRO/GSO/TSO offload на LAN-интерфейсе (`ethtool`)
 8. Применение правил iptables TProxy: весь TCP+UDP из LAN → sing-box порт 7893
 9. Установку sing-box, запись FakeIP-конфига, регистрацию и запуск systemd-сервисов
+
+### Обновление уже развёрнутой коробки
+
+Для коробки, которая уже работает (Wi-Fi/DHCP/сеть уже настроены — переотвечать на эти
+вопросы или рисковать сломать рабочую установку не хочется), но отстала по фиксам:
+
+```bash
+python update.py            # Windows        (или двойной клик update.bat)
+python3 update.py           # macOS / Linux  (или двойной клик update.command на macOS)
+
+python update.py --check    # только показать, есть ли обновление, ничего не менять
+```
+
+Спросит IP коробки, SSH-логин и какой вид деплоя на ней стоит (справочно —
+соответствующий скрипт **не** перезапускается, сетевые настройки не трогаются). Дальше:
+
+1. Тянет актуальный `server/server.py` с GitHub (`raw.githubusercontent.com`; если GitHub
+   недоступен — берёт локальную копию рядом с `update.py`)
+2. Сверяет с тем, что реально на коробке, игнорируя специфичную для неё строку `INT_IFACE`
+3. Если отличается — показывает diff, делает бэкап, накатывает новую версию, перезапускает
+   `jackalrouter`, проверяет что сервис жив **и** API `/status` отвечает — при провале
+   любой из проверок автоматически откатывает бэкап
+4. Перегенерирует `/etc/sing-box/config.json` под **уже настроенный** на коробке прокси
+   (чтобы фикс вроде QUIC/DNS применился сразу, а не только при следующем нажатии
+   **Route** в клиенте) и перезапускает `sing-box`
+5. Создаёт systemd-юнит `jackal-policy-routing`, если его ещё нет (в старых деплоях его
+   не было — без него policy routing для TProxy не переживает перезагрузку)
 
 ### Настройка роутера (один раз)
 

@@ -9,6 +9,9 @@ import subprocess
 import json
 import re
 import os
+import sys
+import shutil
+import tempfile
 import socket
 import ssl
 import struct
@@ -16,6 +19,7 @@ import time
 import threading
 import logging
 import ipaddress
+import urllib.request
 from typing import Tuple
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
@@ -27,6 +31,8 @@ INT_IFACE    = "enp3s0"                   # LAN-интерфейс (к техн�
 SINGBOX_PORT = 7893                        # TProxy inbound port
 SINGBOX_CONF = "/etc/sing-box/config.json"
 SERVER_PORT  = 8000
+GITHUB_REPO  = "MorganWeistling/JackalRouter"   # источник для кнопки Update в клиенте
+GITHUB_REF   = "main"
 # ─────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -649,6 +655,165 @@ async def set_quic(block_quic: bool):
     except Exception as e:
         log.error(f"Ошибка при установке QUIC: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Самообновление (кнопка Update в клиенте) ────────────────────────────────
+# То же самое, что делает update.py по SSH, но выполняется НА САМОЙ коробке —
+# клиент не умеет SSH, только HTTP к этому серверу. INT_IFACE_RE тот же
+# формат, что использует update.py на удалённой стороне.
+INT_IFACE_RE = re.compile(r'^INT_IFACE\s*=\s*"[^"]*"', re.MULTILINE)
+
+
+def fetch_github_server_py() -> str:
+    url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_REF}/server/server.py"
+    with urllib.request.urlopen(url, timeout=15) as r:
+        content = r.read().decode("utf-8")
+    if "def make_singbox_conf" not in content:
+        raise ValueError("похоже на не тот файл (нет make_singbox_conf)")
+    return content
+
+
+def normalize_int_iface(new_content: str, cur_content: str) -> str:
+    """INT_IFACE — своя для каждой коробки, тянуть чужую с GitHub нельзя."""
+    m = INT_IFACE_RE.search(cur_content)
+    if not m:
+        return new_content
+    return INT_IFACE_RE.sub(m.group(0), new_content, count=1)
+
+
+def validate_new_server_py(content: str) -> Tuple[bool, str]:
+    """Компилирует и делает лёгкий import-smoke-test НОВОГО файла в отдельном
+    подпроцессе, не трогая текущий работающий процесс. На self-update-рестарте
+    (в отличие от update.py по SSH) откатывать уже некому, если новый код не
+    взлетит — процесс, который мог бы это заметить, сам будет убит рестартом.
+    Поэтому здесь всё проверяем ДО замены файла, а не после."""
+    fd, tmp_path = tempfile.mkstemp(suffix=".py")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(content)
+
+        r = subprocess.run([sys.executable, "-m", "py_compile", tmp_path],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return False, f"Синтаксическая ошибка: {r.stderr.strip()[:500]}"
+
+        check_code = (
+            "import importlib.util\n"
+            f"spec = importlib.util.spec_from_file_location('_selfupdate_check', {tmp_path!r})\n"
+            "m = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(m)\n"
+        )
+        r2 = subprocess.run([sys.executable, "-c", check_code],
+                            capture_output=True, text=True, timeout=15)
+        if r2.returncode != 0:
+            return False, f"Ошибка импорта: {r2.stderr.strip()[-500:]}"
+        return True, ""
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+def ensure_policy_routing_unit():
+    """Тот же юнит, что создаёт update.py по SSH — без него ip rule/ip route
+    для TProxy не переживают перезагрузку."""
+    unit_path = "/etc/systemd/system/jackal-policy-routing.service"
+    if os.path.exists(unit_path):
+        return
+    with open(unit_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(
+            "[Unit]\n"
+            "Description=JackalRouter: policy routing for TProxy (fwmark 1 -> table 100)\n"
+            "After=network-online.target\n"
+            "Wants=network-online.target\n"
+            "Before=sing-box.service\n\n"
+            "[Service]\n"
+            "Type=oneshot\n"
+            "RemainAfterExit=yes\n"
+            "ExecStart=/bin/sh -c 'ip rule add fwmark 1 table 100 2>/dev/null; "
+            "ip route add local default dev lo table 100 2>/dev/null; exit 0'\n\n"
+            "[Install]\n"
+            "WantedBy=multi-user.target\n"
+        )
+    run("systemctl daemon-reload")
+    run("systemctl enable jackal-policy-routing -q")
+    run("ip rule add fwmark 1 table 100")
+    run("ip route add local default dev lo table 100")
+
+
+@app.get("/self_update/check")
+async def self_update_check():
+    """Ничего не меняет — только сообщает, есть ли обновление на GitHub."""
+    try:
+        new_content = fetch_github_server_py()
+    except Exception as e:
+        return {"status": "error", "error": f"GitHub недоступен: {e}"}
+
+    cur_content = open(os.path.abspath(__file__), "r", encoding="utf-8").read()
+    new_content = normalize_int_iface(new_content, cur_content)
+    return {"status": "ok", "update_available": new_content != cur_content}
+
+
+@app.post("/self_update")
+async def self_update():
+    """Тянет актуальный server.py с GitHub и применяет его прямо на коробке —
+    кнопка Update в клиенте, SSH не требуется. Config.json перегенерируется
+    под уже настроенный прокси СРАЗУ (старым, ещё не заменённым кодом —
+    новые функции для этого не нужны), а сам процесс (jackalrouter)
+    перезапускается последним, в фоне, чтобы ответ успел уйти клиенту."""
+    try:
+        new_content = fetch_github_server_py()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"GitHub недоступен: {e}")
+
+    cur_path = os.path.abspath(__file__)
+    cur_content = open(cur_path, "r", encoding="utf-8").read()
+    new_content = normalize_int_iface(new_content, cur_content)
+
+    if new_content == cur_content:
+        return {"status": "uptodate", "message": "Уже последняя версия."}
+
+    log.info("self_update: проверяю новый server.py перед применением…")
+    valid, err = validate_new_server_py(new_content)
+    if not valid:
+        log.error(f"self_update: новая версия не прошла проверку: {err}")
+        raise HTTPException(status_code=500,
+                            detail=f"Новая версия не прошла проверку, НЕ применена: {err}")
+
+    backup_path = f"{cur_path}.bak-{time.strftime('%Y%m%d%H%M%S')}"
+    shutil.copy2(cur_path, backup_path)
+    with open(cur_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(new_content)
+    log.info(f"self_update: server.py обновлён (бэкап {backup_path})")
+
+    # Конфиг под текущий прокси и юнит policy routing — старым кодом, он
+    # ещё живёт в памяти этого процесса и ничего нового для этого не требует.
+    try:
+        proxy = read_active_proxy()
+        udp_ok = check_udp_associate(proxy["ip"], proxy["port"],
+                                     proxy["user"], proxy["password"])
+        write_singbox_conf(proxy["ip"], proxy["port"], proxy["user"], proxy["password"],
+                           udp_supported=udp_ok)
+        run("systemctl restart sing-box")
+        log.info(f"self_update: конфиг перегенерирован (udp_supported={udp_ok})")
+    except Exception as e:
+        log.warning(f"self_update: перегенерировать конфиг прокси не удалось (нет активного прокси?): {e}")
+
+    ensure_policy_routing_unit()
+
+    def restart_self():
+        time.sleep(1.5)  # дать HTTP-ответу уйти клиенту до убийства процесса
+        code, _, err = run("systemctl restart jackalrouter")
+        if code != 0:
+            log.error(f"self_update: не удалось перезапустить jackalrouter: {err}")
+    threading.Thread(target=restart_self, daemon=True).start()
+
+    return {
+        "status": "updated",
+        "message": "Обновление применено, сервис перезапускается…",
+        "backup": backup_path,
+    }
 
 
 @app.post("/stop_proxy")

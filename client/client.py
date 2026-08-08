@@ -311,6 +311,19 @@ S = {
         "health_err":     "✗ Тест не выполнен: {}",
         "health_st_ok":   "Канал работает ✓",
         "health_st_fail": "Прокси не тянет ✗",
+        "btn_update":     "⬆  Update",
+        "update_checking": "Проверяю обновления на сервере…",
+        "update_start":   "→  POST http://{}:{}/self_update",
+        "update_uptodate": "✓ На сервере уже последняя версия",
+        "update_applied": "✓ Обновление применено, сервис перезапускается…",
+        "update_verifying": "Проверяю, что сервис поднялся после обновления…",
+        "update_done":    "✓ Обновлено и работает — сервис в норме",
+        "update_done_slow": "⚠ Обновление применено, но сервис пока не ответил — проверьте сервер",
+        "update_err":     "✗ Обновление не выполнено: {}",
+        "update_st_checking": "Проверка обновлений…",
+        "update_st_uptodate": "Актуально ✓",
+        "update_st_done": "Обновлено ✓",
+        "update_st_err":  "Ошибка обновления ✗",
         "errc_no_proxy":        "прокси не задан на сервере",
         "errc_socks_handshake": "прокси не отвечает по SOCKS5",
         "errc_socks_auth":      "неверный логин/пароль прокси",
@@ -428,6 +441,19 @@ S = {
         "health_err":     "✗ Test failed: {}",
         "health_st_ok":   "Channel works ✓",
         "health_st_fail": "Proxy can't pull ✗",
+        "btn_update":     "⬆  Update",
+        "update_checking": "Checking for updates on the server…",
+        "update_start":   "→  POST http://{}:{}/self_update",
+        "update_uptodate": "✓ Server already has the latest version",
+        "update_applied": "✓ Update applied, service is restarting…",
+        "update_verifying": "Checking the service came back up after the update…",
+        "update_done":    "✓ Updated and running — service healthy",
+        "update_done_slow": "⚠ Update applied, but the service hasn't responded yet — check the server",
+        "update_err":     "✗ Update failed: {}",
+        "update_st_checking": "Checking for updates…",
+        "update_st_uptodate": "Up to date ✓",
+        "update_st_done": "Updated ✓",
+        "update_st_err":  "Update failed ✗",
         "errc_no_proxy":        "no proxy set on server",
         "errc_socks_handshake": "proxy SOCKS5 handshake failed",
         "errc_socks_auth":      "wrong proxy login/password",
@@ -742,6 +768,11 @@ class App:
                                     page_bg=self.SURF, command=lambda: self._set_lang("en"))
         self.btn_en.pack(side="left", padx=2, pady=2)
 
+        self.btn_update = RoundedButton(head, text="", width=110, height=28, radius=8,
+                                        bg=self.SURF, fg=self.MUTED, hover=self.SURF2,
+                                        page_bg=self.BG, command=self._on_update)
+        self.btn_update.pack(side="right", anchor="n", padx=(0, 8), pady=(3, 0))
+
         # ── Карточка «Сейчас раздаётся» ──────────────────────────────────────
         cur = self._card(p, accent=self.GREEN, pady=(0, 12))
         cur_row = tk.Frame(cur, bg=self.CARD)
@@ -957,6 +988,7 @@ class App:
         self.btn_clean.config_text(t["btn_clean"])
         self.btn_server.config_text(t["btn_server"])
         self.btn_health.config_text(t["btn_health"])
+        self.btn_update.config_text(t["btn_update"])
         if not getattr(self, "_cur_set", False):
             self.lbl_cur_val.config(text=t["cur_none"], fg=self.MUTED)
 
@@ -1021,7 +1053,7 @@ class App:
         st = "normal" if enabled else "disabled"
         for b in (self.btn_apply, self.btn_stop, self.btn_check, self.btn_udp, self.btn_clean,
                   self.btn_server, self.btn_cur, self.btn_health, self.btn_hist_load,
-                  self.btn_hist_check, self.btn_hist_delete):
+                  self.btn_hist_check, self.btn_hist_delete, self.btn_update):
             b.set_state(st)
 
     # ── Применить прокси ──────────────────────────────────────────────────────
@@ -1124,6 +1156,93 @@ class App:
     def _on_stop_err(self, msg: str):
         self._log(msg, "err")
         self._status(self._("st_err"), self.RED)
+        self._set_buttons(True)
+
+    # ── Update (кнопка в шапке) ─────────────────────────────────────────────────
+    # Сервер сам тянет актуальный server.py с GitHub, валидирует (компиляция +
+    # import-smoke-test в отдельном подпроцессе — не трогая рабочий процесс),
+    # применяет с бэкапом и перезапускает себя. Клиент только жмёт кнопку и
+    # получает ответ ДО того, как сервис перезапустится (сервер откладывает
+    # рестарт на ~1.5с в фоновом потоке специально ради этого).
+
+    def _on_update(self):
+        ubuntu_ip = self.ip_var.get().strip()
+        if not ubuntu_ip:
+            self._log(self._("err_no_ip"), "err"); return
+
+        self._set_buttons(False)
+        self._status(self._("update_st_checking"), self.YELLOW)
+        self._log(self._("update_checking"), "info")
+        self._log(self._("update_start", ubuntu_ip, SERVER_PORT), "info")
+        threading.Thread(target=self._send_update, args=(ubuntu_ip,), daemon=True).start()
+
+    def _send_update(self, ubuntu_ip: str):
+        url = f"http://{ubuntu_ip}:{SERVER_PORT}/self_update"
+        try:
+            # Дольше обычного TIMEOUT: сервер сам ходит на GitHub + компилирует
+            # + импортирует новую версию в подпроцессе, прежде чем ответить.
+            resp = requests.post(url, timeout=max(TIMEOUT, 30))
+            resp.raise_for_status()
+            data = resp.json()
+            self.root.after(0, self._on_update_ok, data, ubuntu_ip)
+        except requests.exceptions.ConnectionError:
+            self.root.after(0, self._on_update_err,
+                self._("log_conn_err", ubuntu_ip, SERVER_PORT))
+        except requests.exceptions.Timeout:
+            self.root.after(0, self._on_update_err,
+                self._("log_timeout", max(TIMEOUT, 30)))
+        except requests.exceptions.HTTPError as e:
+            detail = ""
+            try: detail = e.response.json().get("detail", "")
+            except Exception: pass
+            self.root.after(0, self._on_update_err,
+                self._("log_http_err", e.response.status_code, detail))
+        except Exception as e:
+            self.root.after(0, self._on_update_err, self._("log_unk_err", e))
+
+    def _on_update_ok(self, data: dict, ubuntu_ip: str):
+        status = data.get("status")
+        if status == "uptodate":
+            self._log(self._("update_uptodate"), "ok")
+            self._status(self._("update_st_uptodate"), self.GREEN)
+            self._set_buttons(True)
+            return
+
+        # status == "updated": сервис уже перезапускается на стороне сервера —
+        # подождём и переспросим /status, чтобы честно подтвердить, что он
+        # реально поднялся, а не просто отрапортовать и надеяться.
+        self._log(self._("update_applied"), "ok")
+        self._log(self._("update_verifying"), "info")
+        threading.Thread(target=self._verify_update, args=(ubuntu_ip,), daemon=True).start()
+
+    def _verify_update(self, ubuntu_ip: str, attempt: int = 1, max_attempts: int = 6):
+        time.sleep(2)
+        try:
+            resp = requests.get(f"http://{ubuntu_ip}:{SERVER_PORT}/status", timeout=5)
+            resp.raise_for_status()
+            resp.json()  # сервис ответил валидным JSON — значит поднялся
+            self.root.after(0, self._on_update_verified, True)
+            return
+        except Exception:
+            pass
+        if attempt < max_attempts:
+            self._verify_update(ubuntu_ip, attempt + 1, max_attempts)
+        else:
+            self.root.after(0, self._on_update_verified, False)
+
+    def _on_update_verified(self, healthy: bool):
+        if healthy:
+            self._log(self._("update_done"), "ok")
+            self._status(self._("update_st_done"), self.GREEN)
+        else:
+            self._log(self._("update_done_slow"), "warn")
+            self._status(self._("update_st_err"), self.YELLOW)
+        self._set_buttons(True)
+        self._on_refresh_current()
+
+    def _on_update_err(self, msg: str):
+        self._log(self._("update_err", msg), "err")
+        self._status(self._("update_st_err"), self.RED)
         self._set_buttons(True)
 
     # ── QUIC переключатель ────────────────────────────────────────────────────

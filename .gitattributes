@@ -5,3 +5,4 @@
 *.py          text eol=lf
 *.command     text eol=lf
 deploy.bat    text eol=crlf
+update.bat    text eol=crlf

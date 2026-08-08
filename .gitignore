@@ -52,5 +52,8 @@ client/build/
 client/dist/
 client/*.spec
 
+# Byproduct backup from icon conversion — mag.ico is the actual asset
+client/*.ico.bak
+
 # Scratch / debug artifacts (screenshots, temp diagnostic files)
 .scratch/
