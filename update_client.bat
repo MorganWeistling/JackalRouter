@@ -39,6 +39,7 @@ if exist "client\dist\JackalRouter.exe" (
 
 echo Пересобираю клиент (PyInstaller)...
 python -m PyInstaller --noconfirm --onefile --windowed --name JackalRouter ^
+    --icon client\mag.ico --add-data "client\mag.ico;." ^
     --distpath client\dist --workpath client\build --specpath client client\client.py
 
 if errorlevel 1 (
