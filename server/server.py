@@ -13,6 +13,7 @@ import socket
 import ssl
 import struct
 import time
+import threading
 import logging
 import ipaddress
 from typing import Tuple
@@ -600,10 +601,14 @@ async def set_proxy(req: ProxyRequest):
             user=proxy["user"], password=proxy["password"],
             udp_supported=udp_ok,
         )
-        code, _, err = run("systemctl restart sing-box")
-        if code != 0:
-            raise RuntimeError(f"systemctl restart sing-box: {err}")
-        log.info("sing-box перезапущен успешно.")
+        log.info("Конфиг записан, перезапуск sing-box в фоне…")
+        def restart_in_bg():
+            code, _, err = run("systemctl restart sing-box")
+            if code != 0:
+                log.error(f"Ошибка перезапуска sing-box: {err}")
+            else:
+                log.info("sing-box перезапущен успешно.")
+        threading.Thread(target=restart_in_bg, daemon=True).start()
         return {
             "status": "ok",
             "message": "Прокси применён, sing-box перезапущен.",
@@ -619,14 +624,19 @@ async def set_proxy(req: ProxyRequest):
 async def stop_proxy():
     """Отключает прокси-туннель и возвращает DNS в прямой режим.
     Конфиг sing-box переписывается на bypass: весь трафик идёт напрямую,
-    DNS перехватывается TPROXY (iptables) но резолвится напрямую без FakeIP."""
+    DNS перехватывается TPROXY (iptables) но резолвится напрямую без FakeIP.
+    Перезапуск sing-box происходит асинхронно в фоне (не ждём ответа)."""
     try:
         log.info("Отключаю прокси-туннель…")
         write_singbox_bypass_conf()
-        code, _, err = run("systemctl restart sing-box")
-        if code != 0:
-            raise RuntimeError(f"systemctl restart sing-box: {err}")
-        log.info("Прокси отключен, sing-box перезапущен в bypass-режиме.")
+        log.info("Конфиг записан, перезапуск sing-box в фоне…")
+        def restart_in_bg():
+            code, _, err = run("systemctl restart sing-box")
+            if code != 0:
+                log.error(f"Ошибка перезапуска sing-box: {err}")
+            else:
+                log.info("sing-box перезапущен в bypass-режиме.")
+        threading.Thread(target=restart_in_bg, daemon=True).start()
         return {
             "status": "ok",
             "message": "Прокси отключен, весь трафик идёт напрямую.",
