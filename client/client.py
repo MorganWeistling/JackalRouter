@@ -32,6 +32,7 @@ except ImportError:
 
 SERVER_PORT  = 8000
 TIMEOUT      = 15
+CLIENT_VERSION = "1.13.0"   # держим в синхроне с VERSION в корне репозитория
 # Cloudflare — держит QUIC/HTTP3 на 443 на фиксированном IP (не нужен доп.
 # DNS-резолв в теле SOCKS5 UDP-релея). Используется только для проверки
 # QUIC-пробы, к реальному трафику пользователя отношения не имеет.
@@ -743,6 +744,7 @@ class App:
         root.configure(bg=self.BG)
         self._build()
         self._apply_lang()
+        self._log(f"JackalRouter v{CLIENT_VERSION}", "info")
         # Тихая фоновая проверка обновления клиента — не блокирует запуск,
         # ничего не показывает, если обновлять нечего.
         self._client_update_content = None
