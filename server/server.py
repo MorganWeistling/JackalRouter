@@ -131,7 +131,7 @@ def check_udp_associate(ip: str, port: int, user: str, password: str,
 
 
 def make_singbox_conf(ip: str, port: int, user: str, password: str,
-                      udp_supported: bool = True) -> dict:
+                      udp_supported: bool = True, block_quic: bool = False) -> dict:
     # Адрес прокси часто задают доменом (например geo.iproyal.com). Такой домен
     # НЕЛЬЗЯ резолвить через сам прокси: чтобы подключиться к прокси, надо
     # сначала узнать его адрес, а чтобы узнать адрес — надо подключиться к
@@ -163,11 +163,10 @@ def make_singbox_conf(ip: str, port: int, user: str, password: str,
         {"action": "sniff"},
         {"protocol": "dns", "action": "hijack-dns"},
     ]
-    if not udp_supported:
-        # Апстрим не умеет UDP ASSOCIATE (проверено check_udp_associate перед
-        # вызовом) — блокируем QUIC ЯВНО, до попытки релея через прокси.
-        # Иначе TPROXY тихо роняет пакеты, и устройства зависают в ожидании
-        # QUIC вместо мгновенного отката на TCP/HTTP2.
+    if block_quic:
+        # Явная блокировка QUIC: используется для улучшения детекта резидентного IP
+        # и избежания медленных соединений когда QUIC не поддерживается прокси.
+        # Но это ломает приложения вроде Bet365 которые требуют QUIC/HTTP3.
         route_rules.append({"protocol": "quic", "outbound": "block"})
     route_rules.append({"ip_is_private": True, "outbound": "direct"})
     if proxy_is_domain:
@@ -300,12 +299,12 @@ def make_singbox_bypass_conf() -> dict:
 
 
 def write_singbox_conf(ip: str, port: int, user: str, password: str,
-                       udp_supported: bool = True):
+                       udp_supported: bool = True, block_quic: bool = False):
     os.makedirs(os.path.dirname(SINGBOX_CONF), exist_ok=True)
-    conf = make_singbox_conf(ip, port, user, password, udp_supported=udp_supported)
+    conf = make_singbox_conf(ip, port, user, password, udp_supported=udp_supported, block_quic=block_quic)
     with open(SINGBOX_CONF, "w") as f:
         json.dump(conf, f, indent=2)
-    log.info(f"Записан {SINGBOX_CONF}  [{ip}:{port}]  udp_supported={udp_supported}")
+    log.info(f"Записан {SINGBOX_CONF}  [{ip}:{port}]  udp_supported={udp_supported}  block_quic={block_quic}")
 
 
 def write_singbox_bypass_conf():
@@ -620,6 +619,38 @@ async def set_proxy(req: ProxyRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/set_quic")
+async def set_quic(block_quic: bool):
+    """Включить/отключить блокировку QUIC.
+    block_quic=True: блокировать QUIC (лучше для детекта, может ломать Bet365)
+    block_quic=False: разрешить QUIC (работает Bet365, может быть медленнее)"""
+    try:
+        log.info(f"Устанавливаю QUIC блокировку: {block_quic}")
+        proxy_data = read_active_proxy()
+        write_singbox_conf(
+            ip=proxy_data["ip"], port=proxy_data["port"],
+            user=proxy_data["user"], password=proxy_data["password"],
+            udp_supported=True,  # предполагаем, что уже проверили
+            block_quic=block_quic,
+        )
+        log.info("Конфиг записан, перезапуск sing-box в фоне…")
+        def restart_in_bg():
+            code, _, err = run("systemctl restart sing-box")
+            if code != 0:
+                log.error(f"Ошибка перезапуска sing-box: {err}")
+            else:
+                log.info(f"sing-box перезапущен. QUIC: {'блокирован' if block_quic else 'разрешен'}")
+        threading.Thread(target=restart_in_bg, daemon=True).start()
+        return {
+            "status": "ok",
+            "quic_blocked": block_quic,
+            "message": f"QUIC: {'блокирован' if block_quic else 'разрешен'}",
+        }
+    except Exception as e:
+        log.error(f"Ошибка при установке QUIC: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/stop_proxy")
 async def stop_proxy():
     """Отключает прокси-туннель и возвращает DNS в прямой режим.
@@ -657,12 +688,18 @@ async def status():
 
     proxy = None
     mode = "bypass"
+    quic_blocked = False
     try:
         conf = json.load(open(SINGBOX_CONF))
         for ob in conf.get("outbounds", []):
             if ob.get("tag") == "proxy":
                 proxy = f"{ob['server']}:{ob['server_port']}"
                 mode = "proxy"
+                break
+        # Проверяем, есть ли правило блокировки QUIC в маршрутах
+        for rule in conf.get("route", {}).get("rules", []):
+            if rule.get("protocol") == "quic" and rule.get("outbound") == "block":
+                quic_blocked = True
                 break
     except Exception:
         pass
@@ -675,6 +712,7 @@ async def status():
         "port":     SINGBOX_PORT,
         "mode":     mode,
         "proxy":    proxy,
+        "quic_blocked": quic_blocked,
     }
 
 

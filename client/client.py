@@ -325,6 +325,7 @@ S = {
         "hint":           "Формат: ip:port:user:pass  или  user:pass@ip:port",
         "btn_apply":      "  Route  ",
         "btn_stop":       "  ⊘ Stop  ",
+        "chk_quic":       "Блокировать QUIC (лучше для детекта)",
         "btn_check":      "⬡  Проверить прокси",
         "btn_udp":        "⬡  Проверить UDP",
         "btn_server":     "⬡  Проверить сервер",
@@ -441,6 +442,7 @@ S = {
         "hint":           "Format: ip:port:user:pass  or  user:pass@ip:port",
         "btn_apply":      "  Route  ",
         "btn_stop":       "  ⊘ Stop  ",
+        "chk_quic":       "Block QUIC (better for detection)",
         "btn_check":      "⬡  Check proxy",
         "btn_udp":        "⬡  Check UDP",
         "btn_server":     "⬡  Check server",
@@ -808,6 +810,16 @@ class App:
                                        page_bg=self.CARD, command=self._on_clean_check)
         self.btn_clean.pack(side="left", padx=(8, 0))
 
+        # ── Чекбокс QUIC ─────────────────────────────────────────────────────
+        quic_box = tk.Frame(p, bg=self.BG)
+        quic_box.pack(fill="x", padx=18, pady=(8, 0))
+        self.quic_var = tk.BooleanVar(value=False)
+        self.chk_quic = tk.Checkbutton(quic_box, text="", variable=self.quic_var,
+                                       bg=self.BG, fg=self.TEXT, selectcolor=self.BG,
+                                       activebackground=self.BG, activeforeground=self.TEXT,
+                                       font=("Segoe UI", 9), command=self._on_quic_toggle)
+        self.chk_quic.pack(side="left")
+
         # ── Кнопки Route и Stop ──────────────────────────────────────────────
         route_box = tk.Frame(p, bg=self.BG)
         route_box.pack(fill="x", padx=18, pady=(0, 8))
@@ -939,6 +951,7 @@ class App:
         self.lbl_cur_title.config(text=t["cur_label"])
         self.btn_apply.config_text(t["btn_apply"].strip())
         self.btn_stop.config_text(t["btn_stop"].strip())
+        self.chk_quic.config(text=t["chk_quic"])
         self.btn_check.config_text(t["btn_check"])
         self.btn_udp.config_text(t["btn_udp"])
         self.btn_clean.config_text(t["btn_clean"])
@@ -1112,6 +1125,55 @@ class App:
         self._log(msg, "err")
         self._status(self._("st_err"), self.RED)
         self._set_buttons(True)
+
+    # ── QUIC переключатель ────────────────────────────────────────────────────
+
+    def _on_quic_toggle(self):
+        ubuntu_ip = self.ip_var.get().strip()
+        if not ubuntu_ip:
+            self._log(self._("err_no_ip"), "err")
+            self.quic_var.set(not self.quic_var.get())  # откатить чекбокс
+            return
+
+        block_quic = self.quic_var.get()
+        self._set_buttons(False)
+        self._status(self._("sending"), self.YELLOW)
+        self._log(f"→  POST http://{ubuntu_ip}:{SERVER_PORT}/set_quic?block_quic={block_quic}", "info")
+        threading.Thread(target=self._send_quic, args=(ubuntu_ip, block_quic), daemon=True).start()
+
+    def _send_quic(self, ubuntu_ip: str, block_quic: bool):
+        url = f"http://{ubuntu_ip}:{SERVER_PORT}/set_quic?block_quic={block_quic}"
+        try:
+            resp = requests.post(url, timeout=TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            self.root.after(0, self._on_quic_ok, data, block_quic)
+        except requests.exceptions.ConnectionError:
+            self.root.after(0, self._on_quic_err,
+                self._("log_conn_err", ubuntu_ip, SERVER_PORT), block_quic)
+        except requests.exceptions.Timeout:
+            self.root.after(0, self._on_quic_err,
+                self._("log_timeout", TIMEOUT), block_quic)
+        except requests.exceptions.HTTPError as e:
+            detail = ""
+            try: detail = e.response.json().get("detail", "")
+            except Exception: pass
+            self.root.after(0, self._on_quic_err,
+                self._("log_http_err", e.response.status_code, detail), block_quic)
+        except Exception as e:
+            self.root.after(0, self._on_quic_err, self._("log_unk_err", e), block_quic)
+
+    def _on_quic_ok(self, data: dict, block_quic: bool):
+        msg = f"✓ QUIC: {'блокирован' if block_quic else 'разрешен'}"
+        self._log(msg, "ok")
+        self._status(msg, self.GREEN)
+        self._set_buttons(True)
+
+    def _on_quic_err(self, msg: str, block_quic: bool):
+        self._log(msg, "err")
+        self._status(self._("st_err"), self.RED)
+        self._set_buttons(True)
+        self.quic_var.set(not block_quic)  # откатить чекбокс если ошибка
 
     # ── Проверка прокси ───────────────────────────────────────────────────────
 
@@ -1542,7 +1604,11 @@ class App:
             r = requests.get(f"http://{ubuntu_ip}:{SERVER_PORT}/status",
                              timeout=TIMEOUT)
             r.raise_for_status()
-            active = r.json().get("proxy")
+            status_data = r.json()
+            # Обновляем состояние QUIC чекбокса
+            quic_blocked = status_data.get("quic_blocked", False)
+            self.root.after(0, lambda: self.quic_var.set(quic_blocked))
+            active = status_data.get("proxy")
         except Exception as e:
             self.root.after(0, self._set_current, self._("cur_err", str(e)), self.RED)
             return
