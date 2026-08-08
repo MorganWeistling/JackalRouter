@@ -256,6 +256,48 @@ def make_singbox_conf(ip: str, port: int, user: str, password: str,
     }
 
 
+def make_singbox_bypass_conf() -> dict:
+    """Конфиг для режима БЕЗ прокси — весь трафик идёт напрямую через WAN.
+    DNS перехватывается TPROXY (iptables), но резолвится напрямую без FakeIP."""
+    return {
+        "log": {"level": "info"},
+        "dns": {
+            "servers": [
+                {"type": "tcp", "tag": "direct-dns", "server": "8.8.8.8"},
+            ],
+            "rules": [
+                {"query_type": [64, 65], "action": "reject"},
+            ],
+            "final": "direct-dns",
+            "strategy": "ipv4_only",
+        },
+        "inbounds": [{
+            "type": "tproxy",
+            "tag": "tproxy-in",
+            "listen": "0.0.0.0",
+            "listen_port": SINGBOX_PORT,
+        }],
+        "outbounds": [
+            {"type": "direct", "tag": "direct"},
+            {"type": "block",  "tag": "block"},
+        ],
+        "route": {
+            "default_domain_resolver": "direct-dns",
+            "rules": [
+                {"action": "sniff"},
+                {"protocol": "dns", "action": "hijack-dns"},
+                {"ip_is_private": True, "outbound": "direct"},
+            ],
+            "final": "direct",
+        },
+        "experimental": {
+            "cache_file": {
+                "enabled": False,
+            }
+        },
+    }
+
+
 def write_singbox_conf(ip: str, port: int, user: str, password: str,
                        udp_supported: bool = True):
     os.makedirs(os.path.dirname(SINGBOX_CONF), exist_ok=True)
@@ -263,6 +305,15 @@ def write_singbox_conf(ip: str, port: int, user: str, password: str,
     with open(SINGBOX_CONF, "w") as f:
         json.dump(conf, f, indent=2)
     log.info(f"Записан {SINGBOX_CONF}  [{ip}:{port}]  udp_supported={udp_supported}")
+
+
+def write_singbox_bypass_conf():
+    """Пишет bypass-конфиг (без прокси, весь трафик прямо)."""
+    os.makedirs(os.path.dirname(SINGBOX_CONF), exist_ok=True)
+    conf = make_singbox_bypass_conf()
+    with open(SINGBOX_CONF, "w") as f:
+        json.dump(conf, f, indent=2)
+    log.info(f"Записан {SINGBOX_CONF}  (bypass режим, прокси отключен)")
 
 
 # ── iptables (TProxy) ─────────────────────────────────────────────────────────
@@ -564,6 +615,28 @@ async def set_proxy(req: ProxyRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/stop_proxy")
+async def stop_proxy():
+    """Отключает прокси-туннель и возвращает DNS в прямой режим.
+    Конфиг sing-box переписывается на bypass: весь трафик идёт напрямую,
+    DNS перехватывается TPROXY (iptables) но резолвится напрямую без FakeIP."""
+    try:
+        log.info("Отключаю прокси-туннель…")
+        write_singbox_bypass_conf()
+        code, _, err = run("systemctl restart sing-box")
+        if code != 0:
+            raise RuntimeError(f"systemctl restart sing-box: {err}")
+        log.info("Прокси отключен, sing-box перезапущен в bypass-режиме.")
+        return {
+            "status": "ok",
+            "message": "Прокси отключен, весь трафик идёт напрямую.",
+            "mode": "bypass",
+        }
+    except Exception as e:
+        log.error(f"Ошибка отключения прокси: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/status")
 async def status():
     def svc(name: str) -> str:
@@ -573,11 +646,13 @@ async def status():
     iptables_ok = run("iptables -t mangle -L SING_BOX -n")[0] == 0
 
     proxy = None
+    mode = "bypass"
     try:
         conf = json.load(open(SINGBOX_CONF))
         for ob in conf.get("outbounds", []):
             if ob.get("tag") == "proxy":
                 proxy = f"{ob['server']}:{ob['server_port']}"
+                mode = "proxy"
                 break
     except Exception:
         pass
@@ -588,6 +663,7 @@ async def status():
         "iptables": "ok" if iptables_ok else "error",
         "iface":    INT_IFACE,
         "port":     SINGBOX_PORT,
+        "mode":     mode,
         "proxy":    proxy,
     }
 

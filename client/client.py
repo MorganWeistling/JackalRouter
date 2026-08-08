@@ -324,6 +324,7 @@ S = {
         "proxy_label":    "Прокси:",
         "hint":           "Формат: ip:port:user:pass  или  user:pass@ip:port",
         "btn_apply":      "  Route  ",
+        "btn_stop":       "  ⊘ Stop  ",
         "btn_check":      "⬡  Проверить прокси",
         "btn_udp":        "⬡  Проверить UDP",
         "btn_server":     "⬡  Проверить сервер",
@@ -439,6 +440,7 @@ S = {
         "proxy_label":    "Proxy:",
         "hint":           "Format: ip:port:user:pass  or  user:pass@ip:port",
         "btn_apply":      "  Route  ",
+        "btn_stop":       "  ⊘ Stop  ",
         "btn_check":      "⬡  Check proxy",
         "btn_udp":        "⬡  Check UDP",
         "btn_server":     "⬡  Check server",
@@ -806,14 +808,21 @@ class App:
                                        page_bg=self.CARD, command=self._on_clean_check)
         self.btn_clean.pack(side="left", padx=(8, 0))
 
-        # ── Кнопка Route (акцентная, во всю ширину) ──────────────────────────
+        # ── Кнопки Route и Stop ──────────────────────────────────────────────
         route_box = tk.Frame(p, bg=self.BG)
         route_box.pack(fill="x", padx=18, pady=(0, 8))
-        self.btn_apply = RoundedButton(route_box, text="", height=46, radius=12,
+        btns_row = tk.Frame(route_box, bg=self.BG)
+        btns_row.pack(fill="x")
+        self.btn_apply = RoundedButton(btns_row, text="", height=46, radius=12,
                                        bg=self.BLUE, fg=self.BG, hover=self.SAPPH,
                                        page_bg=self.BG, font=("Segoe UI", 12, "bold"),
                                        command=self._on_apply)
-        self.btn_apply.pack(fill="x")
+        self.btn_apply.pack(side="left", fill="both", expand=True)
+        self.btn_stop = RoundedButton(btns_row, text="", height=46, radius=12,
+                                      bg=self.RED, fg=self.BG, hover="#cc3333",
+                                      page_bg=self.BG, font=("Segoe UI", 12, "bold"),
+                                      command=self._on_stop)
+        self.btn_stop.pack(side="left", fill="both", expand=True, padx=(8, 0))
 
         # ── Статус ───────────────────────────────────────────────────────────
         self.status_var = tk.StringVar()
@@ -929,6 +938,7 @@ class App:
         self.lbl_log.config(text=t["log_header"])
         self.lbl_cur_title.config(text=t["cur_label"])
         self.btn_apply.config_text(t["btn_apply"].strip())
+        self.btn_stop.config_text(t["btn_stop"].strip())
         self.btn_check.config_text(t["btn_check"])
         self.btn_udp.config_text(t["btn_udp"])
         self.btn_clean.config_text(t["btn_clean"])
@@ -996,7 +1006,7 @@ class App:
 
     def _set_buttons(self, enabled: bool):
         st = "normal" if enabled else "disabled"
-        for b in (self.btn_apply, self.btn_check, self.btn_udp, self.btn_clean,
+        for b in (self.btn_apply, self.btn_stop, self.btn_check, self.btn_udp, self.btn_clean,
                   self.btn_server, self.btn_cur, self.btn_health, self.btn_hist_load,
                   self.btn_hist_check, self.btn_hist_delete):
             b.set_state(st)
@@ -1053,6 +1063,52 @@ class App:
         self._on_refresh_current()
 
     def _on_apply_err(self, msg: str):
+        self._log(msg, "err")
+        self._status(self._("st_err"), self.RED)
+        self._set_buttons(True)
+
+    # ── Отключить прокси ──────────────────────────────────────────────────────
+
+    def _on_stop(self):
+        ubuntu_ip = self.ip_var.get().strip()
+        if not ubuntu_ip:
+            self._log(self._("err_no_ip"), "err"); return
+
+        self._set_buttons(False)
+        self._status(self._("sending"), self.YELLOW)
+        t = self.LANG[self.lang]
+        self._log(f"→  POST http://{ubuntu_ip}:{SERVER_PORT}/stop_proxy", "info")
+        threading.Thread(target=self._send_stop, args=(ubuntu_ip,), daemon=True).start()
+
+    def _send_stop(self, ubuntu_ip: str):
+        url = f"http://{ubuntu_ip}:{SERVER_PORT}/stop_proxy"
+        try:
+            resp = requests.post(url, timeout=TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            self.root.after(0, self._on_stop_ok, data)
+        except requests.exceptions.ConnectionError:
+            self.root.after(0, self._on_stop_err,
+                self._("log_conn_err", ubuntu_ip, SERVER_PORT))
+        except requests.exceptions.Timeout:
+            self.root.after(0, self._on_stop_err,
+                self._("log_timeout", TIMEOUT))
+        except requests.exceptions.HTTPError as e:
+            detail = ""
+            try: detail = e.response.json().get("detail", "")
+            except Exception: pass
+            self.root.after(0, self._on_stop_err,
+                self._("log_http_err", e.response.status_code, detail))
+        except Exception as e:
+            self.root.after(0, self._on_stop_err, self._("log_unk_err", e))
+
+    def _on_stop_ok(self, data: dict):
+        self._log("✓ Прокси отключен, весь трафик идёт напрямую.", "ok")
+        self._status("Отключено ✓", self.GREEN)
+        self._set_buttons(True)
+        self._on_refresh_current()
+
+    def _on_stop_err(self, msg: str):
         self._log(msg, "err")
         self._status(self._("st_err"), self.RED)
         self._set_buttons(True)
@@ -1705,5 +1761,12 @@ class App:
 
 if __name__ == "__main__":
     root = tk.Tk()
+    try:
+        bundle_dir = getattr(sys, "_MEIPASS", APP_DIR) if getattr(sys, "frozen", False) else APP_DIR
+        icon_path = os.path.join(bundle_dir, "mag.ico")
+        if os.path.exists(icon_path):
+            root.iconbitmap(icon_path)
+    except Exception:
+        pass
     App(root)
     root.mainloop()
