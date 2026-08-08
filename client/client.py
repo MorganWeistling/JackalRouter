@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import time
+import subprocess
 from datetime import datetime
 from urllib.parse import quote
 
@@ -21,14 +22,12 @@ try:
     import requests
     requests.get
 except ImportError:
-    import subprocess
     subprocess.check_call([sys.executable, "-m", "pip", "install", "requests[socks]"])
     import requests
 
 try:
     import socks  # PySocks — needed for SOCKS5 support in requests
 except ImportError:
-    import subprocess
     subprocess.check_call([sys.executable, "-m", "pip", "install", "PySocks"])
 
 SERVER_PORT  = 8000
@@ -49,6 +48,56 @@ if getattr(sys, "frozen", False):
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 HISTORY_FILE = os.path.join(APP_DIR, "proxy_history.json")
+
+# ── Самообновление клиента с GitHub ──────────────────────────────────────────
+# Тот же источник, что у server.py/update.py. Собранный .exe не может
+# перезаписать сам себя на Windows, поэтому обновляем ИСХОДНИК client.py и
+# передаём эстафету update_client.bat — он ждёт закрытия этого процесса,
+# пересобирает через PyInstaller и перезапускает уже новую версию.
+GITHUB_REPO = "MorganWeistling/JackalRouter"
+GITHUB_REF  = "main"
+
+
+def client_source_path() -> str:
+    """Путь к client/client.py: при сборке .exe лежит в client/dist/, сам
+    исходник — на уровень выше (client/client.py); в dev-режиме это и есть
+    выполняющийся файл."""
+    if getattr(sys, "frozen", False):
+        return os.path.normpath(os.path.join(APP_DIR, "..", "client.py"))
+    return os.path.abspath(__file__)
+
+
+def project_root_path() -> str:
+    """Корень репозитория — там лежит update_client.bat."""
+    if getattr(sys, "frozen", False):
+        return os.path.normpath(os.path.join(APP_DIR, "..", ".."))
+    return os.path.normpath(os.path.join(APP_DIR, ".."))
+
+
+def fetch_github_client_py() -> str:
+    url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_REF}/client/client.py"
+    resp = requests.get(url, timeout=15)
+    resp.raise_for_status()
+    content = resp.text
+    if "class App" not in content:
+        raise ValueError("похоже на не тот файл (нет class App)")
+    return content
+
+
+def validate_client_py(content: str) -> tuple:
+    """Только синтаксис — тем же compile(), которым сам Python исполняет код,
+    без внешнего интерпретатора: работает одинаково что в frozen .exe (там
+    нет отдельного python.exe для subprocess), что в dev-режиме. Полного
+    import-smoke-теста, как у server.py, здесь нет: он поднял бы настоящее
+    окно Tkinter — достаточно поймать самый частый случай поломки (битый
+    фетч/синтаксическая ошибка) ДО того, как перезаписывать рабочий файл."""
+    try:
+        compile(content, "client.py", "exec")
+        return True, ""
+    except SyntaxError as e:
+        return False, f"Синтаксическая ошибка: {e}"
+    except Exception as e:
+        return False, str(e)
 CONFIG_FILE  = os.path.join(APP_DIR, "client_config.json")
 
 GEO_URLS = [
@@ -324,6 +373,11 @@ S = {
         "update_st_uptodate": "Актуально ✓",
         "update_st_done": "Обновлено ✓",
         "update_st_err":  "Ошибка обновления ✗",
+        "client_update_banner": "⬆  Доступно обновление клиента — нажмите, чтобы обновить и перезапустить",
+        "client_update_applying": "Скачиваю обновление и перезапускаю клиента…",
+        "client_update_bad": "✗ Новая версия не прошла проверку, НЕ применена: {}",
+        "client_update_no_bat": "✗ update_client.bat не найден рядом — обновите клиента вручную (git pull / скачайте заново).",
+        "client_update_check_err": "Проверка обновления клиента не удалась: {}",
         "errc_no_proxy":        "прокси не задан на сервере",
         "errc_socks_handshake": "прокси не отвечает по SOCKS5",
         "errc_socks_auth":      "неверный логин/пароль прокси",
@@ -454,6 +508,11 @@ S = {
         "update_st_uptodate": "Up to date ✓",
         "update_st_done": "Updated ✓",
         "update_st_err":  "Update failed ✗",
+        "client_update_banner": "⬆  Client update available — click to update and restart",
+        "client_update_applying": "Downloading update and restarting the client…",
+        "client_update_bad": "✗ New version failed validation, NOT applied: {}",
+        "client_update_no_bat": "✗ update_client.bat not found nearby — update the client manually (git pull / re-download).",
+        "client_update_check_err": "Client update check failed: {}",
         "errc_no_proxy":        "no proxy set on server",
         "errc_socks_handshake": "proxy SOCKS5 handshake failed",
         "errc_socks_auth":      "wrong proxy login/password",
@@ -684,6 +743,10 @@ class App:
         root.configure(bg=self.BG)
         self._build()
         self._apply_lang()
+        # Тихая фоновая проверка обновления клиента — не блокирует запуск,
+        # ничего не показывает, если обновлять нечего.
+        self._client_update_content = None
+        threading.Thread(target=self._check_client_update_bg, daemon=True).start()
 
     # ── Построение UI ─────────────────────────────────────────────────────────
 
@@ -773,8 +836,20 @@ class App:
                                         page_bg=self.BG, command=self._on_update)
         self.btn_update.pack(side="right", anchor="n", padx=(0, 8), pady=(3, 0))
 
+        # ── Баннер «доступно обновление клиента» — скрыт, пока не найдено ────
+        # обновление на GitHub (проверяется тихо в фоне при старте). НЕ packed
+        # заранее: место не занимает и не отвлекает, если обновлять нечего.
+        self.banner_client_update = tk.Label(
+            p, bg=self.BLUE, fg=self.BG, font=("Segoe UI", 9, "bold"),
+            cursor="hand2", pady=6)
+        self.banner_client_update.bind("<Button-1>", lambda e: self._on_client_update_apply())
+
         # ── Карточка «Сейчас раздаётся» ──────────────────────────────────────
         cur = self._card(p, accent=self.GREEN, pady=(0, 12))
+        # _card() возвращает внутренний inner-фрейм, а не тот, что реально
+        # packed в p — для banner_client_update ниже нужна ссылка именно на
+        # packed-обёртку (cur.master), чтобы вставить баннер ПЕРЕД ней через before=.
+        self._card_cur_frame = cur.master
         cur_row = tk.Frame(cur, bg=self.CARD)
         cur_row.pack(fill="x")
         self.btn_cur = RoundedButton(cur_row, text="⟳", width=42, height=34, radius=9,
@@ -989,6 +1064,7 @@ class App:
         self.btn_server.config_text(t["btn_server"])
         self.btn_health.config_text(t["btn_health"])
         self.btn_update.config_text(t["btn_update"])
+        self.banner_client_update.config(text=t["client_update_banner"])
         if not getattr(self, "_cur_set", False):
             self.lbl_cur_val.config(text=t["cur_none"], fg=self.MUTED)
 
@@ -1244,6 +1320,94 @@ class App:
         self._log(self._("update_err", msg), "err")
         self._status(self._("update_st_err"), self.RED)
         self._set_buttons(True)
+
+    # ── Обновление самого клиента (баннер, тихая фоновая проверка) ─────────────
+    # В отличие от кнопки Update выше (та обновляет СЕРВЕР на Ubuntu-коробке
+    # по HTTP), это обновляет САМ Windows-клиент с GitHub. Собранный .exe не
+    # может перезаписать сам себя — обновляем исходник client/client.py и
+    # передаём эстафету update_client.bat (ждёт закрытия, пересобирает через
+    # PyInstaller, перезапускает), а сами закрываемся сразу после запуска.
+
+    def _check_client_update_bg(self):
+        try:
+            new_content = fetch_github_client_py()
+            src_path = client_source_path()
+            if not os.path.exists(src_path):
+                return  # exe скопирован отдельно от репозитория — нечего сверять
+            cur_content = open(src_path, "r", encoding="utf-8").read()
+            if new_content != cur_content:
+                self._client_update_content = new_content
+                self.root.after(0, self._show_client_update_banner)
+        except Exception as e:
+            # Тихо — это фоновая необязательная проверка при старте, не мешаем
+            # пользователю всплывающими ошибками из-за временной недоступности GitHub.
+            print(self._("client_update_check_err", e))
+
+    def _show_client_update_banner(self):
+        # before=«Сейчас раздаётся»: и шапка, и эта карточка уже упакованы к
+        # моменту, когда фоновая проверка находит обновление, так что просто
+        # pack() добавил бы баннер В КОНЕЦ (ниже всех карточек) — нужно явно
+        # воткнуть его между шапкой и первой карточкой.
+        self.banner_client_update.pack(fill="x", padx=18, pady=(0, 12),
+                                       before=self._card_cur_frame)
+
+    def _on_client_update_apply(self):
+        if not self._client_update_content:
+            return
+        self.banner_client_update.unbind("<Button-1>")
+        self.banner_client_update.config(text=self._("client_update_applying"), cursor="")
+        self._set_buttons(False)
+        threading.Thread(target=self._apply_client_update, daemon=True).start()
+
+    def _apply_client_update(self):
+        content = self._client_update_content
+        ok, err = validate_client_py(content)
+        if not ok:
+            self.root.after(0, self._on_client_update_err, self._("client_update_bad", err))
+            return
+
+        try:
+            src_path = client_source_path()
+            with open(src_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(content)
+        except Exception as e:
+            self.root.after(0, self._on_client_update_err, str(e))
+            return
+
+        if getattr(sys, "frozen", False):
+            bat_path = os.path.join(project_root_path(), "update_client.bat")
+            if not os.path.exists(bat_path):
+                self.root.after(0, self._on_client_update_err, self._("client_update_no_bat"))
+                return
+            try:
+                # CREATE_NEW_CONSOLE: отдельное окно — видно, что пересборка
+                # идёт, скрипт переживёт закрытие этого процесса (не привязан
+                # к нашему stdout/stdin).
+                subprocess.Popen([bat_path], cwd=project_root_path(),
+                                 creationflags=subprocess.CREATE_NEW_CONSOLE)
+            except Exception as e:
+                self.root.after(0, self._on_client_update_err, str(e))
+                return
+        else:
+            # Dev-режим: перезапускаем сам процесс, пересборка exe не нужна.
+            subprocess.Popen([sys.executable, os.path.abspath(__file__)])
+
+        self.root.after(0, self._shutdown_for_client_update)
+
+    def _on_client_update_err(self, msg: str):
+        self._log(msg, "err")
+        self.banner_client_update.pack_forget()
+        self._set_buttons(True)
+
+    def _shutdown_for_client_update(self):
+        # Даём update_client.bat/новому процессу шанс полностью стартовать
+        # свою собственную обработку, прежде чем убить текущий — сама
+        # пересборка/relaunch запущены уже отдельным процессом (see above),
+        # это только закрывает GUI, чтобы освободить .exe от блокировки файла.
+        try:
+            self.root.destroy()
+        finally:
+            os._exit(0)
 
     # ── QUIC переключатель ────────────────────────────────────────────────────
 
