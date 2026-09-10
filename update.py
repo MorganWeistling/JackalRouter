@@ -327,12 +327,27 @@ try:
     spec = importlib.util.spec_from_file_location("srv", "/opt/jackalrouter/server.py")
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
-    udp_ok = m.check_udp_associate(o['server'], o['server_port'],
-                                   o.get('username', ''), o.get('password', ''))
-    m.write_singbox_conf(o['server'], o['server_port'],
-                         o.get('username', ''), o.get('password', ''),
-                         udp_supported=udp_ok)
-    print(f"OK udp_supported={udp_ok}")
+    # Файл уже заменён на новый (см. cp выше), поэтому здесь работает НОВАЯ
+    # логика: probe_proxy сам решает и про QUIC, и про транспорт резолвера.
+    # Без этого коробка на прокси с закрытым :53 (резидентные шлюзы вроде
+    # nsocks) получила бы конфиг с plain-DNS и осталась бы нерабочей.
+    pref = m.read_quic_pref() if hasattr(m, "read_quic_pref") else False
+    if hasattr(m, "probe_proxy"):
+        caps = m.probe_proxy(o['server'], o['server_port'],
+                             o.get('username', ''), o.get('password', ''))
+        m.write_singbox_conf(o['server'], o['server_port'],
+                             o.get('username', ''), o.get('password', ''),
+                             udp_supported=caps['udp_supported'], block_quic=pref,
+                             dns_mode=caps['dns_mode'], dns_server=caps['dns_server'])
+        print(f"OK udp_supported={caps['udp_supported']} "
+              f"dns={caps['dns_mode']}:{caps['dns_server']} block_quic={pref}")
+    else:
+        udp_ok = m.check_udp_associate(o['server'], o['server_port'],
+                                       o.get('username', ''), o.get('password', ''))
+        m.write_singbox_conf(o['server'], o['server_port'],
+                             o.get('username', ''), o.get('password', ''),
+                             udp_supported=udp_ok)
+        print(f"OK udp_supported={udp_ok}")
 except Exception as e:
     print(f"ERROR {e}")
 PYEOF

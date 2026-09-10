@@ -17,6 +17,7 @@ import ssl
 import struct
 import time
 import threading
+import concurrent.futures as cf
 import logging
 import ipaddress
 import urllib.request
@@ -30,9 +31,22 @@ import uvicorn
 INT_IFACE    = "enp3s0"                   # LAN-интерфейс (к техническому роутеру)
 SINGBOX_PORT = 7893                        # TProxy inbound port
 SINGBOX_CONF = "/etc/sing-box/config.json"
+# Каталог создают все четыре деплой-скрипта и apply_iptables, поэтому отдельный
+# шаг установки под этот файл не нужен.
+STATE_FILE   = "/var/lib/sing-box/jackal_state.json"
 SERVER_PORT  = 8000
 GITHUB_REPO  = "MorganWeistling/JackalRouter"   # источник для кнопки Update в клиенте
 GITHUB_REF   = "main"
+
+# Резолвер, которым sing-box резолвит ВЕСЬ клиентский трафик — ходит через прокси.
+# Только IP-литералы: у сертификатов 8.8.8.8 и 1.1.1.1 адрес прописан в IP SAN,
+# поэтому режим DoH работает с полной проверкой сертификата и без bootstrap-
+# резолва самого резолвера (иначе получили бы ту же DNS-петлю, что и с доменом
+# прокси). ALT пробуется, только если основной недоступен через прокси.
+PROXY_DNS_IP   = "8.8.8.8"
+PROXY_DNS_ALT  = "1.1.1.1"
+PROBE_TIMEOUT  = 5    # лимит на ОДНУ пробу апстрима
+PROBE_DEADLINE = 9    # лимит на ВСЕ пробы разом: клиент ждёт /set_proxy 15 с
 # ─────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -76,6 +90,37 @@ def _is_ip_literal(value: str) -> bool:
         return False
 
 
+def _is_ipv4_literal(value: str) -> bool:
+    """Строгая проверка на IPv4 — для выбора ATYP в SOCKS5-запросе, где v6
+    потребовал бы ATYP=4 и другой упаковки адреса. Весь тракт всё равно ipv4_only."""
+    try:
+        return isinstance(ipaddress.ip_address(value), ipaddress.IPv4Address)
+    except ValueError:
+        return False
+
+
+def _dns_query(name: str = "example.com") -> bytes:
+    """Минимальный DNS-запрос A-записи (без длины — её добавляет транспорт)."""
+    q = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+    for part in name.encode().split(b"."):
+        q += bytes([len(part)]) + part
+    return q + b"\x00\x00\x01\x00\x01"
+
+
+def _recv_exact(sock: socket.socket, n: int, timeout: float) -> bytes:
+    """recv() возвращает столько, сколько пришло, а не сколько попросили.
+    Для SOCKS5-ответа это обычно сходит с рук, но если сразу за ним идёт
+    TLS-хендшейк (DoH-проба), недочитанный хвост ломает поток. Дочитываем ровно n."""
+    sock.settimeout(timeout)
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise RuntimeError("connection closed")
+        buf += chunk
+    return buf
+
+
 def check_udp_associate(ip: str, port: int, user: str, password: str,
                         timeout: int = 6) -> bool:
     """Проверяет, поддерживает ли апстрим-прокси SOCKS5 UDP ASSOCIATE.
@@ -114,12 +159,8 @@ def check_udp_associate(ip: str, port: int, user: str, password: str,
         bnd_port = struct.unpack("!H", resp[8:10])[0]
         if bnd_ip in ("0.0.0.0", "127.0.0.1"):
             bnd_ip = ip
-        dns = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
-        for part in b"example.com".split(b"."):
-            dns += bytes([len(part)]) + part
-        dns += b"\x00\x00\x01\x00\x01"
-        pkt = b"\x00\x00\x00\x01" + socket.inet_aton("8.8.8.8") \
-            + struct.pack("!H", 53) + dns
+        pkt = b"\x00\x00\x00\x01" + socket.inet_aton(PROXY_DNS_IP) \
+            + struct.pack("!H", 53) + _dns_query()
         u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         u.settimeout(timeout)
         u.sendto(pkt, (bnd_ip, bnd_port))
@@ -137,7 +178,14 @@ def check_udp_associate(ip: str, port: int, user: str, password: str,
 
 
 def make_singbox_conf(ip: str, port: int, user: str, password: str,
-                      udp_supported: bool = True, block_quic: bool = False) -> dict:
+                      udp_supported: bool = True, block_quic: bool = False,
+                      dns_mode: str = "tcp53", dns_server: str = PROXY_DNS_IP) -> dict:
+    # Если upstream-прокси не поддерживает SOCKS5 UDP ASSOCIATE, QUIC/HTTP3
+    # нельзя безопасно запускать через него: это гарантированно приводит к
+    # зависанию/залипанию QUIC-хендшейка. Делаем явный запрет QUIC не только
+    # когда пользователь вручную включил флаг, но и когда proxy не умеет UDP.
+    effective_block_quic = block_quic or not udp_supported
+
     # Адрес прокси часто задают доменом (например geo.iproyal.com). Такой домен
     # НЕЛЬЗЯ резолвить через сам прокси: чтобы подключиться к прокси, надо
     # сначала узнать его адрес, а чтобы узнать адрес — надо подключиться к
@@ -148,6 +196,19 @@ def make_singbox_conf(ip: str, port: int, user: str, password: str,
     # которые резолвят и маршрутизируют именно его напрямую. Весь остальной
     # трафик по-прежнему идёт через прокси, утечек это не добавляет.
     proxy_is_domain = not _is_ip_literal(ip)
+
+    # Транспорт резолвера, который ходит ЧЕРЕЗ прокси. Тег "proxy-dns" одинаков
+    # в обоих режимах, поэтому dns.final, route.default_domain_resolver и правило
+    # "resolve" ссылаются на него как раньше — меняется только способ доставки.
+    # Оба варианта идут внутри туннеля, так что на утечки выбор не влияет.
+    # ВАЖНО: только "https" (HTTP/2 поверх TCP), но НЕ "h3" — h3 это QUIC поверх
+    # UDP, а он тут либо заблокирован правилом, либо не релеится прокси вообще.
+    if dns_mode == "doh":
+        proxy_dns_server = {"type": "https", "tag": "proxy-dns",
+                            "server": dns_server, "detour": "proxy"}
+    else:
+        proxy_dns_server = {"type": "tcp", "tag": "proxy-dns",
+                            "server": dns_server, "detour": "proxy"}
 
     # ВАЖНО: одних dns.rules тут НЕ хватает. route.default_domain_resolver
     # задаёт DNS-сервер для резолва адресов исходящих соединений напрямую,
@@ -169,7 +230,7 @@ def make_singbox_conf(ip: str, port: int, user: str, password: str,
         {"action": "sniff"},
         {"protocol": "dns", "action": "hijack-dns"},
     ]
-    if block_quic:
+    if effective_block_quic:
         # Явная блокировка QUIC: используется для улучшения детекта резидентного IP
         # и избежания медленных соединений когда QUIC не поддерживается прокси.
         # Но это ломает приложения вроде Bet365 которые требуют QUIC/HTTP3.
@@ -228,9 +289,9 @@ def make_singbox_conf(ip: str, port: int, user: str, password: str,
         "dns": {
             "servers": [
                 {"type": "fakeip", "tag": "fakeip", "inet4_range": "198.18.0.0/15"},
-                {"type": "tcp", "tag": "proxy-dns", "server": "8.8.8.8", "detour": "proxy"},
+                proxy_dns_server,
                 # Без detour — используется только для адреса самого прокси
-                {"type": "tcp", "tag": "direct-dns", "server": "8.8.8.8"},
+                {"type": "tcp", "tag": "direct-dns", "server": PROXY_DNS_IP},
             ],
             "rules": dns_rules,
             "final": "proxy-dns",
@@ -304,13 +365,63 @@ def make_singbox_bypass_conf() -> dict:
     }
 
 
+def read_state() -> dict:
+    """Состояние коробки, которое НЕЛЬЗЯ вывести из config.json. Всё выводимое
+    (режим DNS, наличие блокировки QUIC) по-прежнему читается из самого конфига —
+    единственный источник истины, чтобы нечему было рассинхронизироваться."""
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def write_state(**values) -> None:
+    st = read_state()
+    st.update(values)
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(st, f, indent=2)
+    except Exception as e:
+        log.warning(f"Не удалось записать {STATE_FILE}: {e}")
+
+
+def read_quic_pref() -> bool:
+    """Галка «блокировать QUIC» — это ВЫБОР пользователя, и вывести его из
+    конфига нельзя: правило блокировки выглядит одинаково и когда галку
+    поставили руками, и когда QUIC заблокирован автоматически, потому что прокси
+    не умеет UDP ASSOCIATE (effective_block_quic). Без отдельного хранения
+    /status возвращал бы автоблокировку как выбор пользователя, и галка в
+    клиенте прыгала бы обратно сама. Поэтому храним отдельно."""
+    st = read_state()
+    if "block_quic" in st:
+        return bool(st["block_quic"])
+    # Коробка ещё не знает про state-файл (сразу после обновления) — ведём себя
+    # как раньше и выводим значение из конфига.
+    try:
+        conf = json.load(open(SINGBOX_CONF))
+        for rule in conf.get("route", {}).get("rules", []):
+            if rule.get("protocol") == "quic" and rule.get("outbound") == "block":
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def write_singbox_conf(ip: str, port: int, user: str, password: str,
-                       udp_supported: bool = True, block_quic: bool = False):
+                       udp_supported: bool = True, block_quic: bool = False,
+                       dns_mode: str = "tcp53", dns_server: str = PROXY_DNS_IP):
     os.makedirs(os.path.dirname(SINGBOX_CONF), exist_ok=True)
-    conf = make_singbox_conf(ip, port, user, password, udp_supported=udp_supported, block_quic=block_quic)
+    conf = make_singbox_conf(ip, port, user, password, udp_supported=udp_supported,
+                             block_quic=block_quic, dns_mode=dns_mode, dns_server=dns_server)
     with open(SINGBOX_CONF, "w") as f:
         json.dump(conf, f, indent=2)
-    log.info(f"Записан {SINGBOX_CONF}  [{ip}:{port}]  udp_supported={udp_supported}  block_quic={block_quic}")
+    # Запоминаем именно ВЫБОР пользователя, а не итоговую блокировку.
+    write_state(block_quic=bool(block_quic))
+    log.info(f"Записан {SINGBOX_CONF}  [{ip}:{port}]  udp_supported={udp_supported}  "
+             f"block_quic={block_quic}  effective_block_quic={block_quic or not udp_supported}  "
+             f"dns={dns_mode}:{dns_server}")
 
 
 def write_singbox_bypass_conf():
@@ -434,15 +545,29 @@ def err_code(msg: str) -> str:
 
 
 def read_active_proxy() -> dict:
-    """Достаёт активный прокси (ip/port/user/pass) из текущего config.json sing-box."""
+    """Достаёт активный прокси (ip/port/user/pass) из текущего config.json sing-box,
+    плюс режим резолвера. Источник истины — сам конфиг, отдельного файла состояния
+    нет: он бы рассинхронизировался. Режим однозначно читается по типу транспорта
+    proxy-dns, и это важно для /set_quic — он перезаписывает конфиг целиком и без
+    этого сбросил бы DoH обратно на :53, положив прокси, которым :53 недоступен."""
     conf = json.load(open(SINGBOX_CONF))
+
+    dns_mode, dns_server = "tcp53", PROXY_DNS_IP
+    for srv in conf.get("dns", {}).get("servers", []):
+        if srv.get("tag") == "proxy-dns":
+            dns_mode = "doh" if srv.get("type") == "https" else "tcp53"
+            dns_server = srv.get("server", PROXY_DNS_IP)
+            break
+
     for ob in conf.get("outbounds", []):
         if ob.get("tag") == "proxy":
             return {
-                "ip":       ob["server"],
-                "port":     int(ob["server_port"]),
-                "user":     ob.get("username", ""),
-                "password": ob.get("password", ""),
+                "ip":         ob["server"],
+                "port":       int(ob["server_port"]),
+                "user":       ob.get("username", ""),
+                "password":   ob.get("password", ""),
+                "dns_mode":   dns_mode,
+                "dns_server": dns_server,
             }
     raise RuntimeError("no proxy outbound (tag=proxy) in config.json")
 
@@ -513,12 +638,142 @@ def socks5_connect(host: str, port: int, user: str, password: str,
         resp = s.recv(2)
         if len(resp) < 2 or resp[1] != 0:
             s.close(); raise RuntimeError("proxy auth failed")
-    d = target_host.encode()
-    s.sendall(b"\x05\x01\x00\x03" + bytes([len(d)]) + d + target_port.to_bytes(2, "big"))
-    resp = s.recv(10)
-    if len(resp) < 2 or resp[1] != 0:
+    if _is_ipv4_literal(target_host):
+        # ATYP=1 — ровно так адресует и sing-box: правило "resolve" разворачивает
+        # домен в IP ДО выбора аутбаунда, и до прокси долетает уже IP. Пробы
+        # обязаны повторять этот путь, иначе проверят не то, что поедет в бою.
+        req = b"\x05\x01\x00\x01" + socket.inet_aton(target_host)
+    else:
+        d = target_host.encode()
+        req = b"\x05\x01\x00\x03" + bytes([len(d)]) + d
+    s.sendall(req + target_port.to_bytes(2, "big"))
+    # Ответ читаем по длине ATYP, а не фиксированными 10 байтами: при ATYP=3
+    # (домен) хвост остаётся в сокете и портит следующий за ним TLS-хендшейк.
+    try:
+        resp = _recv_exact(s, 4, timeout)
+        if resp[1] != 0:
+            raise RuntimeError("rejected")
+        atyp = resp[3]
+        if atyp == 1:
+            _recv_exact(s, 6, timeout)
+        elif atyp == 3:
+            _recv_exact(s, _recv_exact(s, 1, timeout)[0] + 2, timeout)
+        elif atyp == 4:
+            _recv_exact(s, 18, timeout)
+    except Exception:
         s.close(); raise RuntimeError("proxy CONNECT failed")
     return s
+
+
+def probe_dns_tcp53(ip: str, port: int, user: str, password: str,
+                    server: str = PROXY_DNS_IP, timeout: int = PROBE_TIMEOUT) -> bool:
+    """Проверяет plain DNS-over-TCP :53 через прокси — ровно тот транспорт,
+    которым резолвит sing-box в режиме dns_mode="tcp53".
+
+    Обнаружено на живой коробке: резидентные шлюзы (nsocks.com) отбивают CONNECT
+    на ЛЮБОЙ адрес с портом 53 и 853 кодом 2 ("not allowed by ruleset") — типовой
+    антиабуз против DNS-туннелей. Порты 80/443 при этом открыты. Для нас это
+    фатально: на proxy-dns завязаны и dns.final, и route.default_domain_resolver,
+    и правило "resolve", которое дёргается на КАЖДОЕ соединение. Резолв не
+    проходит — устройства просто виснут, «сайты не открываются»."""
+    s = None
+    try:
+        s = socks5_connect(ip, port, user, password, server, 53, timeout=timeout)
+        q = _dns_query()
+        s.sendall(struct.pack("!H", len(q)) + q)          # DNS-over-TCP: префикс длины
+        n = struct.unpack("!H", _recv_exact(s, 2, timeout))[0]
+        return 12 <= n <= 4096 and len(_recv_exact(s, n, timeout)) == n
+    except Exception:
+        return False
+    finally:
+        try:
+            if s:
+                s.close()
+        except Exception:
+            pass
+
+
+def probe_dns_doh(ip: str, port: int, user: str, password: str,
+                  server: str = PROXY_DNS_IP, timeout: int = PROBE_TIMEOUT) -> bool:
+    """Проверяет DoH (RFC 8484) по :443 через прокси — запасной транспорт для
+    резолвера, когда апстрим режет :53. Проверка сертификата НЕ ослаблена:
+    server всегда IP-литерал, а он есть в IP SAN сертификатов 8.8.8.8 и 1.1.1.1."""
+    s = None
+    try:
+        s = socks5_connect(ip, port, user, password, server, 443, timeout=timeout)
+        s = ssl.create_default_context().wrap_socket(s, server_hostname=server)
+        q = _dns_query()
+        s.sendall(b"POST /dns-query HTTP/1.1\r\nHost: " + server.encode()
+                  + b"\r\nContent-Type: application/dns-message\r\n"
+                    b"Accept: application/dns-message\r\nContent-Length: "
+                  + str(len(q)).encode() + b"\r\nConnection: close\r\n\r\n" + q)
+        s.settimeout(timeout)
+        buf = b""
+        while len(buf) < 65536:
+            head, _, body = buf.partition(b"\r\n\r\n")
+            if head != buf and len(body) >= 12:      # заголовки дочитаны и тело есть
+                break
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        head, _, body = buf.partition(b"\r\n\r\n")
+        return head.startswith(b"HTTP/1.1 200") and len(body) >= 12
+    except Exception:
+        return False
+    finally:
+        try:
+            if s:
+                s.close()
+        except Exception:
+            pass
+
+
+def probe_proxy(ip: str, port: int, user: str, password: str) -> dict:
+    """Один заход всех проверок апстрима: что он умеет — то и включаем в конфиге.
+
+    Пробы идут ПАРАЛЛЕЛЬНО и с общим дедлайном: клиент ждёт /set_proxy не дольше
+    TIMEOUT=15 с, а последовательно (UDP + :53 + DoH) в этот бюджет не влезть.
+    Кто не уложился — считается неподдержанным: консервативный ответ безопаснее."""
+    t_end = time.time() + PROBE_DEADLINE
+    ex = cf.ThreadPoolExecutor(max_workers=3)
+    try:
+        f_udp   = ex.submit(check_udp_associate, ip, port, user, password, PROBE_TIMEOUT)
+        f_tcp53 = ex.submit(probe_dns_tcp53, ip, port, user, password, PROXY_DNS_IP, PROBE_TIMEOUT)
+        f_doh   = ex.submit(probe_dns_doh,   ip, port, user, password, PROXY_DNS_IP, PROBE_TIMEOUT)
+
+        def got(fut) -> bool:
+            try:
+                return bool(fut.result(timeout=max(0.0, t_end - time.time())))
+            except Exception:
+                return False
+
+        udp_ok, tcp53_ok, doh_ok = got(f_udp), got(f_tcp53), got(f_doh)
+    finally:
+        # wait=False: не держим ответ ради «опоздавших» проб, их сокеты закроются сами.
+        ex.shutdown(wait=False)
+
+    if tcp53_ok:
+        # Приоритет у plain :53 намеренно: это ровно тот конфиг, который уже
+        # работает на всём текущем парке прокси. DoH включаем только там, где
+        # без него не поедет вообще — так фикс не меняет поведение остальных.
+        dns_mode, dns_server = "tcp53", PROXY_DNS_IP
+    elif doh_ok:
+        dns_mode, dns_server = "doh", PROXY_DNS_IP
+    elif probe_dns_doh(ip, port, user, password, PROXY_DNS_ALT, PROBE_TIMEOUT):
+        dns_mode, dns_server = "doh", PROXY_DNS_ALT
+    else:
+        # Ни :53, ни DoH. На direct-dns НЕ откатываемся ни при каких условиях:
+        # резолв мимо туннеля — это утечка DNS через реальный IP коробки, ровно
+        # то, ради чего весь проект. Оставляем как было и жалуемся в лог.
+        dns_mode, dns_server = "tcp53", PROXY_DNS_IP
+        log.warning("Прокси не отдаёт ни DNS :53, ни DoH :443 — оставляю :53. "
+                    "Резолв, скорее всего, работать не будет; прокси нерабочий.")
+
+    log.info(f"Прокси умеет: UDP ASSOCIATE={'да' if udp_ok else 'НЕТ (QUIC заблокирую)'}, "
+             f"DNS :53={'да' if tcp53_ok else 'НЕТ'}, DoH :443={'да' if doh_ok else 'нет'} "
+             f"→ резолвер {dns_mode} через {dns_server}")
+    return {"udp_supported": udp_ok, "dns_mode": dns_mode, "dns_server": dns_server}
 
 
 # Параметры health-теста пропускной способности
@@ -596,15 +851,14 @@ async def set_proxy(req: ProxyRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
     try:
-        log.info("Проверяю поддержку UDP ASSOCIATE у прокси перед применением…")
-        udp_ok = check_udp_associate(proxy["ip"], proxy["port"],
-                                     proxy["user"], proxy["password"])
-        log.info(f"UDP ASSOCIATE: {'поддерживается' if udp_ok else 'НЕ поддерживается — QUIC будет заблокирован явно'}")
+        log.info("Проверяю возможности прокси (UDP ASSOCIATE, транспорт DNS) перед применением…")
+        caps = probe_proxy(proxy["ip"], proxy["port"], proxy["user"], proxy["password"])
 
         write_singbox_conf(
             ip=proxy["ip"], port=proxy["port"],
             user=proxy["user"], password=proxy["password"],
-            udp_supported=udp_ok,
+            udp_supported=caps["udp_supported"],
+            dns_mode=caps["dns_mode"], dns_server=caps["dns_server"],
         )
         log.info("Конфиг записан, перезапуск sing-box в фоне…")
         def restart_in_bg():
@@ -618,7 +872,9 @@ async def set_proxy(req: ProxyRequest):
             "status": "ok",
             "message": "Прокси применён, sing-box перезапущен.",
             "proxy": f"{proxy['ip']}:{proxy['port']}",
-            "udp_supported": udp_ok,
+            "udp_supported": caps["udp_supported"],
+            "dns_mode": caps["dns_mode"],
+            "dns_server": caps["dns_server"],
         }
     except Exception as e:
         log.error(f"Ошибка применения прокси: {e}")
@@ -633,11 +889,20 @@ async def set_quic(block_quic: bool):
     try:
         log.info(f"Устанавливаю QUIC блокировку: {block_quic}")
         proxy_data = read_active_proxy()
+        # udp_supported перепроверяем, а не подставляем True: с effective_block_quic
+        # захардкоженный True на прокси без UDP ASSOCIATE снова разрешил бы QUIC —
+        # то самое зависание хендшейка, ради которого блокировка и вводилась.
+        udp_ok = check_udp_associate(proxy_data["ip"], proxy_data["port"],
+                                     proxy_data["user"], proxy_data["password"],
+                                     PROBE_TIMEOUT)
+        # dns_mode берём из конфига, а не пробуем заново: разовый сбой пробы
+        # сбросил бы DoH на :53 и положил прокси, которому :53 закрыт.
         write_singbox_conf(
             ip=proxy_data["ip"], port=proxy_data["port"],
             user=proxy_data["user"], password=proxy_data["password"],
-            udp_supported=True,  # предполагаем, что уже проверили
+            udp_supported=udp_ok,
             block_quic=block_quic,
+            dns_mode=proxy_data["dns_mode"], dns_server=proxy_data["dns_server"],
         )
         log.info("Конфиг записан, перезапуск sing-box в фоне…")
         def restart_in_bg():
@@ -650,6 +915,10 @@ async def set_quic(block_quic: bool):
         return {
             "status": "ok",
             "quic_blocked": block_quic,
+            # На прокси без UDP ASSOCIATE QUIC остаётся заблокирован независимо
+            # от галки — иначе хендшейк зависает. Отдаём это отдельным полем,
+            # чтобы расхождение было видно, а не выглядело как игнор настройки.
+            "quic_effective": block_quic or not udp_ok,
             "message": f"QUIC: {'блокирован' if block_quic else 'разрешен'}",
         }
     except Exception as e:
@@ -787,18 +1056,47 @@ async def self_update():
         f.write(new_content)
     log.info(f"self_update: server.py обновлён (бэкап {backup_path})")
 
-    # Конфиг под текущий прокси и юнит policy routing — старым кодом, он
-    # ещё живёт в памяти этого процесса и ничего нового для этого не требует.
+    # Конфиг под текущий прокси перегенерируем НОВЫМ кодом — подпроцессом,
+    # который импортирует уже записанный файл. В памяти этого процесса живёт
+    # старая версия, и она не знает про возможности, добавленные обновлением:
+    # коробка на прокси с закрытым :53 получила бы от старого кода конфиг с
+    # plain-DNS и осталась бы нерабочей до следующего нажатия Route в клиенте.
+    # Файл только что прошёл import-smoke-test в validate_new_server_py, так
+    # что импортировать его безопасно. Если новая версия таких функций не знает
+    # (откат на старую) — тихо падаем обратно на старый путь.
+    regen_code = (
+        "import importlib.util, json\n"
+        f"spec = importlib.util.spec_from_file_location('_regen', {cur_path!r})\n"
+        "m = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(m)\n"
+        "p = m.read_active_proxy()\n"
+        "pref = m.read_quic_pref()\n"
+        "caps = m.probe_proxy(p['ip'], p['port'], p['user'], p['password'])\n"
+        "m.write_singbox_conf(p['ip'], p['port'], p['user'], p['password'],\n"
+        "                     udp_supported=caps['udp_supported'], block_quic=pref,\n"
+        "                     dns_mode=caps['dns_mode'], dns_server=caps['dns_server'])\n"
+        "print(json.dumps(caps))\n"
+    )
     try:
-        proxy = read_active_proxy()
-        udp_ok = check_udp_associate(proxy["ip"], proxy["port"],
-                                     proxy["user"], proxy["password"])
-        write_singbox_conf(proxy["ip"], proxy["port"], proxy["user"], proxy["password"],
-                           udp_supported=udp_ok)
+        r = subprocess.run([sys.executable, "-c", regen_code],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.strip()[-300:])
         run("systemctl restart sing-box")
-        log.info(f"self_update: конфиг перегенерирован (udp_supported={udp_ok})")
+        log.info(f"self_update: конфиг перегенерирован новым кодом: {r.stdout.strip()}")
     except Exception as e:
-        log.warning(f"self_update: перегенерировать конфиг прокси не удалось (нет активного прокси?): {e}")
+        log.warning(f"self_update: перегенерация новым кодом не удалась ({e}); пробую старым…")
+        try:
+            proxy = read_active_proxy()
+            udp_ok = check_udp_associate(proxy["ip"], proxy["port"],
+                                         proxy["user"], proxy["password"])
+            write_singbox_conf(proxy["ip"], proxy["port"], proxy["user"], proxy["password"],
+                               udp_supported=udp_ok)
+            run("systemctl restart sing-box")
+            log.info(f"self_update: конфиг перегенерирован (udp_supported={udp_ok})")
+        except Exception as e2:
+            log.warning(f"self_update: перегенерировать конфиг прокси не удалось "
+                        f"(нет активного прокси?): {e2}")
 
     ensure_policy_routing_unit()
 
@@ -853,18 +1151,25 @@ async def status():
 
     proxy = None
     mode = "bypass"
-    quic_blocked = False
+    quic_effective = False
+    dns_mode = None
     try:
         conf = json.load(open(SINGBOX_CONF))
+        for srv in conf.get("dns", {}).get("servers", []):
+            if srv.get("tag") == "proxy-dns":
+                dns_mode = "doh" if srv.get("type") == "https" else "tcp53"
+                break
         for ob in conf.get("outbounds", []):
             if ob.get("tag") == "proxy":
                 proxy = f"{ob['server']}:{ob['server_port']}"
                 mode = "proxy"
                 break
-        # Проверяем, есть ли правило блокировки QUIC в маршрутах
+        # Есть ли правило блокировки QUIC в маршрутах — это ФАКТ, а не выбор
+        # пользователя: правило могло появиться и автоматически, из-за прокси
+        # без UDP ASSOCIATE.
         for rule in conf.get("route", {}).get("rules", []):
             if rule.get("protocol") == "quic" and rule.get("outbound") == "block":
-                quic_blocked = True
+                quic_effective = True
                 break
     except Exception:
         pass
@@ -877,7 +1182,12 @@ async def status():
         "port":     SINGBOX_PORT,
         "mode":     mode,
         "proxy":    proxy,
-        "quic_blocked": quic_blocked,
+        # quic_blocked — под ним стоит галка в клиенте, поэтому это выбор
+        # пользователя. quic_effective — что реально в конфиге: на прокси без
+        # UDP ASSOCIATE QUIC заблокирован независимо от галки.
+        "quic_blocked":   read_quic_pref(),
+        "quic_effective": quic_effective,
+        "dns_mode": dns_mode,
     }
 
 

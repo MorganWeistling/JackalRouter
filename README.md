@@ -58,7 +58,22 @@ Standard transparent proxies must resolve DNS to get an IP, then connect by IP �
 3. sing-box sees the connection, looks up its FakeIP table → finds "google.com"
 4. sing-box tells the SOCKS5 proxy: **connect to google.com** (not to an IP)
 
-This means the proxy always receives the real hostname. DNS queries never leave the machine unencrypted. HTTPS/SVCB DNS record types (64/65) are rejected to prevent Cloudflare and other CDNs from bypassing FakeIP via `ipv4hint`.
+This means the proxy always receives the real hostname. No DNS query from a device ever reaches the network directly. HTTPS/SVCB DNS record types (64/65) are rejected to prevent Cloudflare and other CDNs from bypassing FakeIP via `ipv4hint`.
+
+### How the resolver transport is chosen
+
+Resolving the real address behind a FakeIP always happens **through the proxy tunnel** (`proxy-dns`), never over the box's own WAN — resolving directly would expose the operator's real IP to the resolver, which is exactly what this project exists to prevent. The only exception is the proxy's own hostname, which has to be resolved directly (you cannot reach the proxy before you know its address).
+
+Which transport carries those queries is decided per proxy, by probing the upstream when a proxy is applied:
+
+| Upstream allows | Transport used | Why |
+|---|---|---|
+| TCP `:53` through the proxy | plain DNS-over-TCP to `8.8.8.8` | Default — the historical behaviour, kept for every proxy that supports it |
+| `:53` blocked, `:443` open | **DoH** (RFC 8484) to `8.8.8.8`, else `1.1.1.1` | Residential gateways (e.g. nsocks.com) reject *any* destination on port 53/853 with SOCKS reply code 2 (`not allowed by ruleset`) as anti-abuse. Since `proxy-dns` backs `dns.final`, `route.default_domain_resolver` *and* the per-connection `resolve` rule, a blocked `:53` means nothing resolves at all and devices simply hang |
+
+The DoH resolver is always addressed by **IP literal**, so no bootstrap lookup is needed (which would be a DNS loop) and certificate validation stays fully enabled — `8.8.8.8` and `1.1.1.1` are present in their certificates' IP SANs. Note that DoH is HTTP/2 over TCP; HTTP/3 (`h3`) is deliberately not used, since QUIC may be blocked or unsupported by the same upstream.
+
+If neither transport is reachable the box stays on plain `:53` and logs a warning — it never silently falls back to resolving over the real WAN, as that would trade a broken proxy for a DNS leak.
 
 ### How UDP proxying works
 
