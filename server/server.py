@@ -933,10 +933,40 @@ async def set_quic(block_quic: bool):
 INT_IFACE_RE = re.compile(r'^INT_IFACE\s*=\s*"[^"]*"', re.MULTILINE)
 
 
+_GETADDRINFO_LOCK = threading.Lock()
+
+
+def urlopen_ipv4(url: str, timeout: int = 15) -> bytes:
+    """urlopen, принудительно по IPv4.
+
+    raw.githubusercontent.com отдаёт и A, и AAAA. У коробки IPv6-адрес обычно
+    есть, а рабочего маршрута наружу нет, и socket.create_connection перебирает
+    адреса ПОСЛЕДОВАТЕЛЬНО — Happy Eyeballs в stdlib нет. Поэтому первая же
+    AAAA-попытка съедает таймаут целиком, и только после неё идёт IPv4.
+    Замерено на живой коробке: 15.3 с против 0.9 с за тот же файл с ноутбука,
+    то есть ровно timeout=15 в никуда. Из-за этого клиент отваливался по своему
+    30-секундному таймауту раньше, чем сервер успевал применить обновление.
+
+    Резолв сужаем до AF_INET только на время запроса и под локом. Для этой
+    коробки IPv4-only и так штатный режим: ip6tables рубит форвардинг, sing-box
+    работает в ipv4_only."""
+    with _GETADDRINFO_LOCK:
+        orig = socket.getaddrinfo
+
+        def ipv4_only(host, port, family=0, *args, **kwargs):
+            return orig(host, port, socket.AF_INET, *args, **kwargs)
+
+        socket.getaddrinfo = ipv4_only
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as r:
+                return r.read()
+        finally:
+            socket.getaddrinfo = orig
+
+
 def fetch_github_server_py() -> str:
     url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_REF}/server/server.py"
-    with urllib.request.urlopen(url, timeout=15) as r:
-        content = r.read().decode("utf-8")
+    content = urlopen_ipv4(url, timeout=15).decode("utf-8")
     if "def make_singbox_conf" not in content:
         raise ValueError("похоже на не тот файл (нет make_singbox_conf)")
     return content
@@ -1056,56 +1086,62 @@ async def self_update():
         f.write(new_content)
     log.info(f"self_update: server.py обновлён (бэкап {backup_path})")
 
-    # Конфиг под текущий прокси перегенерируем НОВЫМ кодом — подпроцессом,
-    # который импортирует уже записанный файл. В памяти этого процесса живёт
-    # старая версия, и она не знает про возможности, добавленные обновлением:
-    # коробка на прокси с закрытым :53 получила бы от старого кода конфиг с
-    # plain-DNS и осталась бы нерабочей до следующего нажатия Route в клиенте.
-    # Файл только что прошёл import-smoke-test в validate_new_server_py, так
-    # что импортировать его безопасно. Если новая версия таких функций не знает
-    # (откат на старую) — тихо падаем обратно на старый путь.
-    regen_code = (
-        "import importlib.util, json\n"
-        f"spec = importlib.util.spec_from_file_location('_regen', {cur_path!r})\n"
-        "m = importlib.util.module_from_spec(spec)\n"
-        "spec.loader.exec_module(m)\n"
-        "p = m.read_active_proxy()\n"
-        "pref = m.read_quic_pref()\n"
-        "caps = m.probe_proxy(p['ip'], p['port'], p['user'], p['password'])\n"
-        "m.write_singbox_conf(p['ip'], p['port'], p['user'], p['password'],\n"
-        "                     udp_supported=caps['udp_supported'], block_quic=pref,\n"
-        "                     dns_mode=caps['dns_mode'], dns_server=caps['dns_server'])\n"
-        "print(json.dumps(caps))\n"
-    )
-    try:
-        r = subprocess.run([sys.executable, "-c", regen_code],
-                           capture_output=True, text=True, timeout=60)
-        if r.returncode != 0:
-            raise RuntimeError(r.stderr.strip()[-300:])
-        run("systemctl restart sing-box")
-        log.info(f"self_update: конфиг перегенерирован новым кодом: {r.stdout.strip()}")
-    except Exception as e:
-        log.warning(f"self_update: перегенерация новым кодом не удалась ({e}); пробую старым…")
+    # Всё, что осталось, уводим в фон: клиент ждёт ответа 30 с, а перегенерация
+    # конфига (проба апстрима) плюс два systemctl restart в этот бюджет уже не
+    # помещаются. Для клиента обновление СЧИТАЕТСЯ применённым в момент, когда
+    # новый файл записан — это уже произошло выше; остальное к ответу не
+    # относится и всё равно завершается рестартом самого процесса, исход
+    # которого клиент увидеть не может. Порядок прежний: конфиг → sing-box →
+    # сам сервис.
+    def apply_rest():
+        time.sleep(1.5)  # дать HTTP-ответу уйти клиенту до тяжёлой части
+        # Конфиг под текущий прокси перегенерируем НОВЫМ кодом — подпроцессом,
+        # который импортирует уже записанный файл. В памяти этого процесса живёт
+        # старая версия, и она не знает про возможности, добавленные обновлением:
+        # коробка на прокси с закрытым :53 получила бы от старого кода конфиг с
+        # plain-DNS и осталась бы нерабочей до следующего нажатия Route в клиенте.
+        # Файл только что прошёл import-smoke-test в validate_new_server_py, так
+        # что импортировать его безопасно. Если новая версия таких функций не знает
+        # (откат на старую) — тихо падаем обратно на старый путь.
+        regen_code = (
+            "import importlib.util, json\n"
+            f"spec = importlib.util.spec_from_file_location('_regen', {cur_path!r})\n"
+            "m = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(m)\n"
+            "p = m.read_active_proxy()\n"
+            "pref = m.read_quic_pref()\n"
+            "caps = m.probe_proxy(p['ip'], p['port'], p['user'], p['password'])\n"
+            "m.write_singbox_conf(p['ip'], p['port'], p['user'], p['password'],\n"
+            "                     udp_supported=caps['udp_supported'], block_quic=pref,\n"
+            "                     dns_mode=caps['dns_mode'], dns_server=caps['dns_server'])\n"
+            "print(json.dumps(caps))\n"
+        )
         try:
-            proxy = read_active_proxy()
-            udp_ok = check_udp_associate(proxy["ip"], proxy["port"],
-                                         proxy["user"], proxy["password"])
-            write_singbox_conf(proxy["ip"], proxy["port"], proxy["user"], proxy["password"],
-                               udp_supported=udp_ok)
+            r = subprocess.run([sys.executable, "-c", regen_code],
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode != 0:
+                raise RuntimeError(r.stderr.strip()[-300:])
             run("systemctl restart sing-box")
-            log.info(f"self_update: конфиг перегенерирован (udp_supported={udp_ok})")
-        except Exception as e2:
-            log.warning(f"self_update: перегенерировать конфиг прокси не удалось "
-                        f"(нет активного прокси?): {e2}")
+            log.info(f"self_update: конфиг перегенерирован новым кодом: {r.stdout.strip()}")
+        except Exception as e:
+            log.warning(f"self_update: перегенерация новым кодом не удалась ({e}); пробую старым…")
+            try:
+                proxy = read_active_proxy()
+                udp_ok = check_udp_associate(proxy["ip"], proxy["port"],
+                                             proxy["user"], proxy["password"])
+                write_singbox_conf(proxy["ip"], proxy["port"], proxy["user"], proxy["password"],
+                                   udp_supported=udp_ok)
+                run("systemctl restart sing-box")
+                log.info(f"self_update: конфиг перегенерирован (udp_supported={udp_ok})")
+            except Exception as e2:
+                log.warning(f"self_update: перегенерировать конфиг прокси не удалось "
+                            f"(нет активного прокси?): {e2}")
 
-    ensure_policy_routing_unit()
-
-    def restart_self():
-        time.sleep(1.5)  # дать HTTP-ответу уйти клиенту до убийства процесса
+        ensure_policy_routing_unit()
         code, _, err = run("systemctl restart jackalrouter")
         if code != 0:
             log.error(f"self_update: не удалось перезапустить jackalrouter: {err}")
-    threading.Thread(target=restart_self, daemon=True).start()
+    threading.Thread(target=apply_rest, daemon=True).start()
 
     return {
         "status": "updated",
