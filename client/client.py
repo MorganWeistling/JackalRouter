@@ -1209,7 +1209,6 @@ class App:
 
         self._set_buttons(False)
         self._status(self._("sending"), self.YELLOW)
-        t = self.LANG[self.lang]
         self._log(f"→  POST http://{ubuntu_ip}:{SERVER_PORT}/stop_proxy", "info")
         threading.Thread(target=self._send_stop, args=(ubuntu_ip,), daemon=True).start()
 
