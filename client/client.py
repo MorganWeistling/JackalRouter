@@ -738,9 +738,19 @@ class App:
         self.history = self._load_history()
         self.config = self._load_config()
         self._pending_proxy = ""
-        root.geometry("780x680")
+        # 680px высоты не хватало: над карточкой лога стоят шапка, карточка
+        # текущего IP, сервер, прокси, чекбокс QUIC и кнопки Route/Stop — лог
+        # оставался сплющен в узкую полоску, и его приходилось растягивать
+        # руками при каждом запуске. Целимся в высоту экрана минус отступ под
+        # панель задач, но не выше 900 — иначе на маленьких ноутбучных экранах
+        # окно вылезет за край.
+        root.update_idletasks()
+        scr_w, scr_h = root.winfo_screenwidth(), root.winfo_screenheight()
+        w, h = 820, min(900, max(700, scr_h - 120))
+        x, y = max(0, (scr_w - w) // 2), max(0, (scr_h - h) // 2 - 20)
+        root.geometry(f"{w}x{h}+{x}+{y}")
         root.resizable(True, True)
-        root.minsize(720, 600)
+        root.minsize(760, 640)
         root.configure(bg=self.BG)
         self._build()
         self._apply_lang()
