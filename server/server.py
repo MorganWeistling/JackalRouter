@@ -47,6 +47,7 @@ PROXY_DNS_IP   = "8.8.8.8"
 PROXY_DNS_ALT  = "1.1.1.1"
 PROBE_TIMEOUT  = 5    # лимит на ОДНУ пробу апстрима
 PROBE_DEADLINE = 9    # лимит на ВСЕ пробы разом: клиент ждёт /set_proxy 15 с
+GITHUB_FETCH_DEADLINE = 15   # лимит на загрузку с GitHub: клиент ждёт /self_update 30 с
 # ─────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -939,17 +940,15 @@ _GETADDRINFO_LOCK = threading.Lock()
 def urlopen_ipv4(url: str, timeout: int = 15) -> bytes:
     """urlopen, принудительно по IPv4.
 
-    raw.githubusercontent.com отдаёт и A, и AAAA. У коробки IPv6-адрес обычно
-    есть, а рабочего маршрута наружу нет, и socket.create_connection перебирает
-    адреса ПОСЛЕДОВАТЕЛЬНО — Happy Eyeballs в stdlib нет. Поэтому первая же
-    AAAA-попытка съедает таймаут целиком, и только после неё идёт IPv4.
-    Замерено на живой коробке: 15.3 с против 0.9 с за тот же файл с ноутбука,
-    то есть ровно timeout=15 в никуда. Из-за этого клиент отваливался по своему
-    30-секундному таймауту раньше, чем сервер успевал применить обновление.
+    Это подстраховка, а НЕ лечение медленного GitHub (причина оказалась другой,
+    см. fetch_github_server_py). На конкретной коробке глобального IPv6 нет
+    вообще, так что здесь это no-op. Но раз адреса раздаются по-разному в
+    зависимости от провайдера, а socket.create_connection перебирает их
+    ПОСЛЕДОВАТЕЛЬНО (Happy Eyeballs в stdlib нет), одна мёртвая AAAA-запись
+    съела бы весь таймаут до первой же IPv4-попытки. IPv4-only для этого
+    проекта штатный режим: ip6tables рубит форвардинг, sing-box в ipv4_only.
 
-    Резолв сужаем до AF_INET только на время запроса и под локом. Для этой
-    коробки IPv4-only и так штатный режим: ip6tables рубит форвардинг, sing-box
-    работает в ipv4_only."""
+    Резолв сужаем до AF_INET только на время запроса и под локом."""
     with _GETADDRINFO_LOCK:
         orig = socket.getaddrinfo
 
@@ -965,11 +964,38 @@ def urlopen_ipv4(url: str, timeout: int = 15) -> bytes:
 
 
 def fetch_github_server_py() -> str:
+    """Тянет актуальный server.py с GitHub напрямую, короткими попытками.
+
+    Замерено на живой коробке (curl, 5 прогонов подряд): dns=0.02…5.1 с, а
+    time_connect = 15.6 / 31.7 / 20.4 / 20.4 / 1.1 с — это тайминги
+    ретрансмита SYN ядром, то есть провайдер интермиттентно роняет SYN на
+    адреса GitHub. Глобального IPv6 на коробке нет вообще (`ip -6 addr show
+    scope global` пусто), так что дело не в нём.
+
+    Лечение — НЕ поднимать таймаут, а наоборот. Один urlopen(timeout=15)
+    залипал на первом же мёртвом SYN и съедал весь 30-секундный бюджет
+    клиента. Короткая попытка вместо этого быстро сдаётся и начинает новую —
+    а это новый SYN с новым шансом; внутри одной попытки create_connection
+    успевает обойти все четыре A-записи GitHub. Общий дедлайн гарантирует,
+    что мы вернём честную ошибку раньше, чем клиент отвалится по таймауту."""
     url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_REF}/server/server.py"
-    content = urlopen_ipv4(url, timeout=15).decode("utf-8")
-    if "def make_singbox_conf" not in content:
-        raise ValueError("похоже на не тот файл (нет make_singbox_conf)")
-    return content
+    t_end = time.time() + GITHUB_FETCH_DEADLINE
+    attempts, errors = 0, []
+    while True:
+        attempts += 1
+        try:
+            content = urlopen_ipv4(url, timeout=min(5.0, max(2.0, t_end - time.time())))
+            content = content.decode("utf-8")
+            if "def make_singbox_conf" not in content:
+                raise ValueError("похоже на не тот файл (нет make_singbox_conf)")
+            if attempts > 1:
+                log.info(f"server.py получен с GitHub с попытки {attempts}")
+            return content
+        except Exception as e:
+            errors.append(type(e).__name__)
+        if time.time() >= t_end:
+            raise RuntimeError(f"GitHub недоступен за {GITHUB_FETCH_DEADLINE} с "
+                               f"({attempts} попыток: {', '.join(errors[-4:])})")
 
 
 def normalize_int_iface(new_content: str, cur_content: str) -> str:
