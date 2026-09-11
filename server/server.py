@@ -937,7 +937,7 @@ INT_IFACE_RE = re.compile(r'^INT_IFACE\s*=\s*"[^"]*"', re.MULTILINE)
 _GETADDRINFO_LOCK = threading.Lock()
 
 
-def urlopen_ipv4(url: str, timeout: int = 15) -> bytes:
+def urlopen_ipv4(url, timeout: float = 15) -> bytes:
     """urlopen, принудительно по IPv4.
 
     Это подстраховка, а НЕ лечение медленного GitHub (причина оказалась другой,
@@ -948,6 +948,7 @@ def urlopen_ipv4(url: str, timeout: int = 15) -> bytes:
     съела бы весь таймаут до первой же IPv4-попытки. IPv4-only для этого
     проекта штатный режим: ip6tables рубит форвардинг, sing-box в ipv4_only.
 
+    url — строка или urllib.request.Request (нужен для заголовков к API).
     Резолв сужаем до AF_INET только на время запроса и под локом."""
     with _GETADDRINFO_LOCK:
         orig = socket.getaddrinfo
@@ -961,6 +962,36 @@ def urlopen_ipv4(url: str, timeout: int = 15) -> bytes:
                 return r.read()
         finally:
             socket.getaddrinfo = orig
+
+
+def _github_raw_url(timeout: float) -> str:
+    """Ссылка на server.py, которую GitHub отдаст СВЕЖЕЙ.
+
+    Ссылка на ВЕТКУ на это не годится: raw.githubusercontent.com отдаёт её с
+    "cache-control: max-age=300" и после пуша ещё некоторое время возвращает
+    содержимое предыдущего коммита. Проверено на живой коробке: api.github.com
+    уже показывает новый коммит, а raw по ветке шесть запросов подряд отдаёт
+    хэш прошлого — причём cache-buster в query это НЕ лечит. Из-за этого
+    /self_update отвечал "уже последняя версия" сразу после пуша, а однажды,
+    наоборот, увидел расхождение и откатил коробку на предыдущую версию.
+
+    Ссылка, привязанная к SHA коммита, неизменяема и всегда актуальна, поэтому
+    сначала спрашиваем SHA у API, а файл тянем уже по нему. Если API недоступен
+    (в том числе из-за лимита в 60 запросов/час на IP) — откатываемся на ссылку
+    по ветке с cache-buster: это прежнее поведение, лучше чем ничего."""
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{GITHUB_REPO}/commits/{GITHUB_REF}",
+            headers={"User-Agent": "JackalRouter", "Accept": "application/vnd.github+json"})
+        sha = json.loads(urlopen_ipv4(req, timeout=timeout))["sha"]
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            raise ValueError(f"невалидный sha: {sha[:20]!r}")
+        return f"https://raw.githubusercontent.com/{GITHUB_REPO}/{sha}/server/server.py"
+    except Exception as e:
+        log.warning(f"api.github.com недоступен ({type(e).__name__}), "
+                    f"тяну по ветке {GITHUB_REF} — возможна протухшая копия с CDN")
+        return (f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_REF}"
+                f"/server/server.py?cb={time.time_ns()}")
 
 
 def fetch_github_server_py() -> str:
@@ -978,18 +1009,11 @@ def fetch_github_server_py() -> str:
     а это новый SYN с новым шансом; внутри одной попытки create_connection
     успевает обойти все четыре A-записи GitHub. Общий дедлайн гарантирует,
     что мы вернём честную ошибку раньше, чем клиент отвалится по таймауту."""
-    base = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_REF}/server/server.py"
     t_end = time.time() + GITHUB_FETCH_DEADLINE
     attempts, errors = 0, []
     while True:
         attempts += 1
-        # Cache-buster обязателен. raw.githubusercontent.com отдаёт
-        # "cache-control: max-age=300", и сразу после пуша коробка получала с
-        # CDN протухшую копию (проверено: обычный URL → x-cache HIT и старый
-        # хэш, тот же URL с ?cb=… → актуальный). Из-за этого /self_update
-        # отвечал "уже последняя версия" ещё минут пять после пуша — выглядело
-        # так, будто обновление вообще не проверяется.
-        url = f"{base}?cb={time.time_ns()}"
+        url = _github_raw_url(min(5.0, max(2.0, t_end - time.time())))
         try:
             content = urlopen_ipv4(url, timeout=min(5.0, max(2.0, t_end - time.time())))
             content = content.decode("utf-8")
