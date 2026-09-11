@@ -978,11 +978,18 @@ def fetch_github_server_py() -> str:
     а это новый SYN с новым шансом; внутри одной попытки create_connection
     успевает обойти все четыре A-записи GitHub. Общий дедлайн гарантирует,
     что мы вернём честную ошибку раньше, чем клиент отвалится по таймауту."""
-    url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_REF}/server/server.py"
+    base = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_REF}/server/server.py"
     t_end = time.time() + GITHUB_FETCH_DEADLINE
     attempts, errors = 0, []
     while True:
         attempts += 1
+        # Cache-buster обязателен. raw.githubusercontent.com отдаёт
+        # "cache-control: max-age=300", и сразу после пуша коробка получала с
+        # CDN протухшую копию (проверено: обычный URL → x-cache HIT и старый
+        # хэш, тот же URL с ?cb=… → актуальный). Из-за этого /self_update
+        # отвечал "уже последняя версия" ещё минут пять после пуша — выглядело
+        # так, будто обновление вообще не проверяется.
+        url = f"{base}?cb={time.time_ns()}"
         try:
             content = urlopen_ipv4(url, timeout=min(5.0, max(2.0, t_end - time.time())))
             content = content.decode("utf-8")
