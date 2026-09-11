@@ -38,11 +38,23 @@ if exist "client\dist\JackalRouter.exe" (
 )
 
 echo Пересобираю клиент (PyInstaller)...
+REM Собираем ИЗ каталога client, а не из корня. Раньше здесь стояло
+REM "--add-data client\mag.ico;." вместе с "--specpath client", и PyInstaller
+REM резолвил относительный путь от каталога СПЕКИ, а не от текущего каталога —
+REM получалось client\client\mag.ico, и сборка падала ВСЕГДА:
+REM   ERROR: Unable to find '...\client\client\mag.ico' when adding binary and data files
+REM То есть кнопка обновления клиента не могла пересобрать exe ни разу: она
+REM перезаписывала client.py, ловила ошибку, возвращала .bak и запускала старый
+REM exe — исходник и бинарник расходились. Проверено воспроизведением.
+pushd client
 python -m PyInstaller --noconfirm --onefile --windowed --name JackalRouter ^
-    --icon client\mag.ico --add-data "client\mag.ico;." ^
-    --distpath client\dist --workpath client\build --specpath client client\client.py
+    --icon mag.ico --add-data "mag.ico;." ^
+    --distpath dist --workpath build --specpath . client.py
+set "BUILD_RC=%errorlevel%"
+popd
 
-if errorlevel 1 (
+REM errorlevel проверяем по сохранённому коду: popd его затирает.
+if not "%BUILD_RC%"=="0" (
     echo [ОШИБКА] Пересборка не удалась — возвращаю рабочую версию.
     if exist "client\dist\JackalRouter.exe.bak" move /Y "client\dist\JackalRouter.exe.bak" "client\dist\JackalRouter.exe" >nul
     if exist "client\dist\JackalRouter.exe" start "" "client\dist\JackalRouter.exe"

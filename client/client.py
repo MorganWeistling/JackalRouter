@@ -76,7 +76,31 @@ def project_root_path() -> str:
 
 
 def fetch_github_client_py() -> str:
-    url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_REF}/client/client.py"
+    """Тянет client.py с GitHub по SHA коммита, а НЕ по имени ветки.
+
+    Ссылка на ветку для этого не годится: raw.githubusercontent.com отдаёт её
+    с "cache-control: max-age=300" и после пуша ещё некоторое время возвращает
+    содержимое ПРЕДЫДУЩЕГО коммита. А решение «есть ли обновление» здесь —
+    это сравнение своего файла с тем, что вернул URL, поэтому протухший ответ
+    не просто откладывает обновление, он ПЕРЕВОРАЧИВАЕТ решение: проверено на
+    живом клиенте — баннер предложил «обновление», клик применил предыдущую
+    версию и затёр свежий фикс в client.py. Ссылка по SHA неизменяема.
+
+    Если API недоступен (в том числе лимит 60 запросов/час на IP) —
+    откатываемся на ветку с cache-buster: это прежнее поведение."""
+    try:
+        r = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/commits/{GITHUB_REF}",
+                         headers={"User-Agent": "JackalRouter",
+                                  "Accept": "application/vnd.github+json"}, timeout=15)
+        r.raise_for_status()
+        sha = r.json()["sha"]
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            raise ValueError(f"невалидный sha: {sha[:20]!r}")
+        url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{sha}/client/client.py"
+    except Exception:
+        url = (f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_REF}"
+               f"/client/client.py?cb={time.time_ns()}")
+
     resp = requests.get(url, timeout=15)
     resp.raise_for_status()
     content = resp.text
