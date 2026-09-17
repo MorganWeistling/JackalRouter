@@ -9,6 +9,9 @@ WorkingDirectory=/opt/jackalrouter
 ExecStart=/opt/jackalrouter/venv/bin/python3 server.py
 Restart=on-failure
 RestartSec=5
+# Через процесс идёт весь TCP клиентов (fast-relay, по 2 дескриптора на
+# соединение) — дефолтных 1024 не хватает. server.py поднимает лимит и сам.
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target

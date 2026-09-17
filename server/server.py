@@ -5,6 +5,7 @@ JackalRouter — FastAPI-сервер для Ubuntu
 Запускать от root: sudo python3 server.py
 """
 
+import asyncio
 import subprocess
 import json
 import re
@@ -47,6 +48,9 @@ PROXY_DNS_IP   = "8.8.8.8"
 PROXY_DNS_ALT  = "1.1.1.1"
 PROBE_TIMEOUT  = 5    # лимит на ОДНУ пробу апстрима
 PROBE_DEADLINE = 9    # лимит на ВСЕ пробы разом: клиент ждёт /set_proxy 15 с
+# Локальный ускоритель SOCKS5-рукопожатия (см. FastRelay). Только loopback.
+FAST_RELAY_HOST = "127.0.0.1"
+FAST_RELAY_PORT = 7894
 GITHUB_FETCH_DEADLINE = 15   # лимит на загрузку с GitHub: клиент ждёт /self_update 30 с
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -63,6 +67,9 @@ async def lifespan(app: FastAPI):
     if os.geteuid() != 0:
         log.warning("Сервер запущен НЕ от root — правила iptables могут не примениться!")
     apply_iptables()
+    # Свой поток и свой event loop: часть эндпоинтов блокирующая (пробы до 9 с,
+    # health-тест до 25 с), в общем цикле uvicorn они замораживали бы весь трафик.
+    threading.Thread(target=FAST_RELAY.serve_forever, name="fast-relay", daemon=True).start()
     yield
 
 
@@ -180,7 +187,8 @@ def check_udp_associate(ip: str, port: int, user: str, password: str,
 
 def make_singbox_conf(ip: str, port: int, user: str, password: str,
                       udp_supported: bool = True, block_quic: bool = False,
-                      dns_mode: str = "tcp53", dns_server: str = PROXY_DNS_IP) -> dict:
+                      dns_mode: str = "tcp53", dns_server: str = PROXY_DNS_IP,
+                      fast_relay: bool = False) -> dict:
     # Если upstream-прокси не поддерживает SOCKS5 UDP ASSOCIATE, QUIC/HTTP3
     # нельзя безопасно запускать через него: это гарантированно приводит к
     # зависанию/залипанию QUIC-хендшейка. Делаем явный запрет QUIC не только
@@ -198,6 +206,11 @@ def make_singbox_conf(ip: str, port: int, user: str, password: str,
     # трафик по-прежнему идёт через прокси, утечек это не добавляет.
     proxy_is_domain = not _is_ip_literal(ip)
 
+    # Весь TCP (включая резолвер) идёт через локальный ускоритель рукопожатия,
+    # если апстрим его выдерживает (probe_socks_pipelining). UDP ASSOCIATE
+    # ускоритель не умеет — UDP остаётся на обычном socks-outbound "proxy".
+    tcp_out = "proxy-fast" if fast_relay else "proxy"
+
     # Транспорт резолвера, который ходит ЧЕРЕЗ прокси. Тег "proxy-dns" одинаков
     # в обоих режимах, поэтому dns.final, route.default_domain_resolver и правило
     # "resolve" ссылаются на него как раньше — меняется только способ доставки.
@@ -206,10 +219,10 @@ def make_singbox_conf(ip: str, port: int, user: str, password: str,
     # UDP, а он тут либо заблокирован правилом, либо не релеится прокси вообще.
     if dns_mode == "doh":
         proxy_dns_server = {"type": "https", "tag": "proxy-dns",
-                            "server": dns_server, "detour": "proxy"}
+                            "server": dns_server, "detour": tcp_out}
     else:
         proxy_dns_server = {"type": "tcp", "tag": "proxy-dns",
-                            "server": dns_server, "detour": "proxy"}
+                            "server": dns_server, "detour": tcp_out}
 
     # ВАЖНО: одних dns.rules тут НЕ хватает. route.default_domain_resolver
     # задаёт DNS-сервер для резолва адресов исходящих соединений напрямую,
@@ -263,6 +276,8 @@ def make_singbox_conf(ip: str, port: int, user: str, password: str,
     # долетает уже готовый IP. Стоит последним, чтобы все правила выше
     # (direct/block по домену) успели отработать на оригинальном домене.
     route_rules.append({"action": "resolve", "strategy": "ipv4_only"})
+    if fast_relay:
+        route_rules.append({"network": "udp", "outbound": "proxy"})
 
     socks_out = {
         "type": "socks",
@@ -292,6 +307,20 @@ def make_singbox_conf(ip: str, port: int, user: str, password: str,
         # Поле проверено `sing-box check` на 1.13 — конфиг принимается.
         socks_out["domain_resolver"] = "direct-dns"
 
+    # "proxy" остаётся первым и с настоящим адресом апстрима: его читают
+    # read_active_proxy, /status, update.py и локальные патчи (routing_mark).
+    outbounds = [socks_out]
+    if fast_relay:
+        fast_out = {"type": "socks", "tag": "proxy-fast", "server": FAST_RELAY_HOST,
+                    "server_port": FAST_RELAY_PORT, "version": "5"}
+        if user and password:
+            fast_out.update(username=user, password=password)
+        outbounds.append(fast_out)
+    outbounds += [
+        {"type": "direct", "tag": "direct"},
+        {"type": "block",  "tag": "block"},
+    ]
+
     return {
         "log": {"level": "info"},
         "dns": {
@@ -311,15 +340,11 @@ def make_singbox_conf(ip: str, port: int, user: str, password: str,
             "listen": "0.0.0.0",
             "listen_port": SINGBOX_PORT,
         }],
-        "outbounds": [
-            socks_out,
-            {"type": "direct", "tag": "direct"},
-            {"type": "block",  "tag": "block"},
-        ],
+        "outbounds": outbounds,
         "route": {
             "default_domain_resolver": "proxy-dns",
             "rules": route_rules,
-            "final": "proxy",
+            "final": tcp_out,
         },
         "experimental": {
             "cache_file": {
@@ -419,17 +444,24 @@ def read_quic_pref() -> bool:
 
 def write_singbox_conf(ip: str, port: int, user: str, password: str,
                        udp_supported: bool = True, block_quic: bool = False,
-                       dns_mode: str = "tcp53", dns_server: str = PROXY_DNS_IP):
+                       dns_mode: str = "tcp53", dns_server: str = PROXY_DNS_IP,
+                       fast_relay=None):
+    # fast_relay=None — решаем пробой здесь же. Так ускоритель включается и там,
+    # где вызывающий про него не знает: код перегенерации в update.py и в
+    # /self_update ПРЕДЫДУЩЕЙ версии (он исполняется старым процессом).
+    if fast_relay is None:
+        fast_relay = probe_socks_pipelining(ip, port, user, password)
     os.makedirs(os.path.dirname(SINGBOX_CONF), exist_ok=True)
     conf = make_singbox_conf(ip, port, user, password, udp_supported=udp_supported,
-                             block_quic=block_quic, dns_mode=dns_mode, dns_server=dns_server)
+                             block_quic=block_quic, dns_mode=dns_mode, dns_server=dns_server,
+                             fast_relay=fast_relay)
     with open(SINGBOX_CONF, "w") as f:
         json.dump(conf, f, indent=2)
     # Запоминаем именно ВЫБОР пользователя, а не итоговую блокировку.
     write_state(block_quic=bool(block_quic))
     log.info(f"Записан {SINGBOX_CONF}  [{ip}:{port}]  udp_supported={udp_supported}  "
              f"block_quic={block_quic}  effective_block_quic={block_quic or not udp_supported}  "
-             f"dns={dns_mode}:{dns_server}")
+             f"dns={dns_mode}:{dns_server}  fast_relay={fast_relay}")
 
 
 def write_singbox_bypass_conf():
@@ -567,7 +599,9 @@ def read_active_proxy() -> dict:
             dns_server = srv.get("server", PROXY_DNS_IP)
             break
 
-    for ob in conf.get("outbounds", []):
+    outbounds = conf.get("outbounds", [])
+    fast_relay = any(ob.get("tag") == "proxy-fast" for ob in outbounds)
+    for ob in outbounds:
         if ob.get("tag") == "proxy":
             return {
                 "ip":         ob["server"],
@@ -576,6 +610,7 @@ def read_active_proxy() -> dict:
                 "password":   ob.get("password", ""),
                 "dns_mode":   dns_mode,
                 "dns_server": dns_server,
+                "fast_relay": fast_relay,
             }
     raise RuntimeError("no proxy outbound (tag=proxy) in config.json")
 
@@ -737,6 +772,77 @@ def probe_dns_doh(ip: str, port: int, user: str, password: str,
             pass
 
 
+def socks5_hello(user: str, password: str) -> bytes:
+    """Приветствие SOCKS5 и, если есть логин, авторизация — одним куском.
+    Метод предлагаем ровно один, как и sing-box: иначе сервер мог бы выбрать
+    «без авторизации», и отправленные следом логин/пароль он прочитал бы как
+    CONNECT."""
+    if user and password:
+        u, p = user.encode(), password.encode()
+        return b"\x05\x01\x02\x01" + bytes([len(u)]) + u + bytes([len(p)]) + p
+    return b"\x05\x01\x00"
+
+
+def probe_socks_pipelining(ip: str, port: int, user: str, password: str,
+                           timeout: int = PROBE_TIMEOUT) -> bool:
+    """Выдерживает ли апстрим рукопожатие одним пакетом — ровно то, что делает
+    FastRelay: приветствие + логин + CONNECT + первые данные клиента разом.
+
+    Первые данные — настоящий TLS ClientHello к PROXY_DNS_IP:443 (тот же адрес,
+    что у DoH-пробы). Хендшейк завершается, только если сервер не выбросил
+    байты, пришедшие вместе с CONNECT: наивная реализация SOCKS5, читающая
+    каждый шаг в свежий буфер, на этом и сломается — такой прокси остаётся на
+    обычном последовательном рукопожатии sing-box. Сертификат проверяется."""
+    s = None
+    try:
+        incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+        tls = ssl.create_default_context().wrap_bio(incoming, outgoing,
+                                                    server_hostname=PROXY_DNS_IP)
+        try:
+            tls.do_handshake()
+        except ssl.SSLWantReadError:
+            pass
+        has_auth = bool(user and password)
+        s = socket.create_connection((ip, port), timeout=timeout)
+        s.sendall(socks5_hello(user, password)
+                  + b"\x05\x01\x00\x01" + socket.inet_aton(PROXY_DNS_IP) + struct.pack("!H", 443)
+                  + outgoing.read())
+        g = _recv_exact(s, 2, timeout)
+        if g[0] != 5 or g[1] != (2 if has_auth else 0):
+            return False
+        if has_auth and _recv_exact(s, 2, timeout)[1] != 0:
+            return False
+        r = _recv_exact(s, 4, timeout)
+        if r[1] != 0:
+            return False
+        if r[3] == 1:
+            _recv_exact(s, 6, timeout)
+        elif r[3] == 3:
+            _recv_exact(s, _recv_exact(s, 1, timeout)[0] + 2, timeout)
+        elif r[3] == 4:
+            _recv_exact(s, 18, timeout)
+        while True:
+            data = s.recv(16384)
+            if not data:
+                return False
+            incoming.write(data)
+            try:
+                tls.do_handshake()
+                return True
+            except ssl.SSLWantReadError:
+                pending = outgoing.read()
+                if pending:
+                    s.sendall(pending)
+    except Exception:
+        return False
+    finally:
+        try:
+            if s:
+                s.close()
+        except Exception:
+            pass
+
+
 def probe_proxy(ip: str, port: int, user: str, password: str) -> dict:
     """Один заход всех проверок апстрима: что он умеет — то и включаем в конфиге.
 
@@ -744,11 +850,12 @@ def probe_proxy(ip: str, port: int, user: str, password: str) -> dict:
     TIMEOUT=15 с, а последовательно (UDP + :53 + DoH) в этот бюджет не влезть.
     Кто не уложился — считается неподдержанным: консервативный ответ безопаснее."""
     t_end = time.time() + PROBE_DEADLINE
-    ex = cf.ThreadPoolExecutor(max_workers=3)
+    ex = cf.ThreadPoolExecutor(max_workers=4)
     try:
         f_udp   = ex.submit(check_udp_associate, ip, port, user, password, PROBE_TIMEOUT)
         f_tcp53 = ex.submit(probe_dns_tcp53, ip, port, user, password, PROXY_DNS_IP, PROBE_TIMEOUT)
         f_doh   = ex.submit(probe_dns_doh,   ip, port, user, password, PROXY_DNS_IP, PROBE_TIMEOUT)
+        f_pipe  = ex.submit(probe_socks_pipelining, ip, port, user, password, PROBE_TIMEOUT)
 
         def got(fut) -> bool:
             try:
@@ -756,7 +863,7 @@ def probe_proxy(ip: str, port: int, user: str, password: str) -> dict:
             except Exception:
                 return False
 
-        udp_ok, tcp53_ok, doh_ok = got(f_udp), got(f_tcp53), got(f_doh)
+        udp_ok, tcp53_ok, doh_ok, pipe_ok = got(f_udp), got(f_tcp53), got(f_doh), got(f_pipe)
     finally:
         # wait=False: не держим ответ ради «опоздавших» проб, их сокеты закроются сами.
         ex.shutdown(wait=False)
@@ -783,9 +890,323 @@ def probe_proxy(ip: str, port: int, user: str, password: str) -> dict:
                     "Резолв, скорее всего, работать не будет; прокси нерабочий.")
 
     log.info(f"Прокси умеет: UDP ASSOCIATE={'да' if udp_ok else 'НЕТ (QUIC заблокирую)'}, "
-             f"DNS :53={'да' if tcp53_ok else 'НЕТ'}, DoH :443={'да' if doh_ok else 'нет'} "
+             f"DNS :53={'да' if tcp53_ok else 'НЕТ'}, DoH :443={'да' if doh_ok else 'нет'}, "
+             f"рукопожатие одним пакетом={'да' if pipe_ok else 'нет'} "
              f"→ резолвер {dns_mode} через {dns_server}")
-    return {"udp_supported": udp_ok, "dns_mode": dns_mode, "dns_server": dns_server}
+    return {"udp_supported": udp_ok, "dns_mode": dns_mode, "dns_server": dns_server,
+            "pipelining": pipe_ok}
+
+
+# ── Ускоритель SOCKS5-рукопожатия ────────────────────────────────────────────
+
+FAST_EARLY_WAIT      = 0.03   # сколько ещё ждать первых данных клиента, когда TCP до прокси уже готов
+FAST_CONNECT_TIMEOUT = 10
+FAST_REPLY_TIMEOUT   = 15
+FAST_IDLE_HALF_OPEN  = 300    # после EOF с одной стороны: закрыть, если другая молчит столько секунд
+FAST_CHUNK           = 65536
+_SO_MARK = getattr(socket, "SO_MARK", 36)   # 36 — значение из linux/socket.h
+
+
+class FastRelay:
+    """Локальный SOCKS5-ретранслятор между sing-box и апстрим-прокси.
+
+    Клиент SOCKS5 в sing-box ждёт ответа на каждом шаге: TCP, приветствие,
+    логин, CONNECT — 4 RTT до прокси на КАЖДОЕ новое соединение (sing
+    protocol/socks/handshake.go). Здесь sing-box проходит эти шаги по loopback
+    мгновенно, а к прокси уходит один пакет: приветствие + логин + CONNECT +
+    первые данные клиента (обычно TLS ClientHello). Остаются TCP-хендшейк и один
+    обмен. Замерено на живой коробке (RTT до прокси ~98 мс): до первого байта
+    ответа сайта 495 → 198 мс.
+
+    CONNECT подтверждается sing-box сразу, до ответа прокси. Если прокси потом
+    откажет, клиент получит RST вместо кода ошибки — sing-box со своим
+    TProxy-входом ведёт себя так же. Включается в конфиге, только если апстрим
+    прошёл probe_socks_pipelining. Умеет только CONNECT: UDP ASSOCIATE идёт
+    мимо, прямо из sing-box.
+
+    Апстрим (адрес, логин, routing_mark) берётся из outbound "proxy" текущего
+    config.json и перечитывается при его изменении — /set_proxy перезапускает
+    только sing-box, а не этот процесс."""
+
+    def __init__(self):
+        self.stats = {"active": 0, "total": 0, "failed": 0, "early_data": 0}
+        self.listening = False
+        self._upstream = None        # (mtime_ns, dict)
+        self._resolved = {}          # домен прокси -> (ip, годен_до)
+        self._last_log = {}
+
+    # ── апстрим ──
+    def upstream(self) -> dict:
+        mtime = os.stat(SINGBOX_CONF).st_mtime_ns
+        if self._upstream and self._upstream[0] == mtime:
+            return self._upstream[1]
+        with open(SINGBOX_CONF) as f:
+            conf = json.load(f)
+        for ob in conf.get("outbounds", []):
+            if ob.get("tag") == "proxy":
+                mark = ob.get("routing_mark") or 0
+                up = {
+                    "server":   ob["server"],
+                    "port":     int(ob["server_port"]),
+                    "user":     ob.get("username", ""),
+                    "password": ob.get("password", ""),
+                    # Метку пути к прокси уважаем так же, как sing-box: без неё
+                    # трафик ушёл бы другим маршрутом, чем UDP того же прокси.
+                    "mark":     int(mark, 0) if isinstance(mark, str) else int(mark),
+                }
+                self._upstream = (mtime, up)
+                return up
+        raise RuntimeError("в config.json нет outbound proxy")
+
+    async def resolve(self, host: str) -> str:
+        # Домен самого прокси sing-box резолвит напрямую (direct-dns), мимо
+        # туннеля — иначе петля. Здесь то же самое, системным резолвером.
+        if _is_ip_literal(host):
+            return host
+        now = time.time()
+        hit = self._resolved.get(host)
+        if hit and hit[1] > now:
+            return hit[0]
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            host, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
+        ip = infos[0][4][0]
+        self._resolved[host] = (ip, now + 60)
+        return ip
+
+    async def open_upstream(self, up: dict):
+        ip = await self.resolve(up["server"])
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            if up["mark"] and sys.platform.startswith("linux"):
+                s.setsockopt(socket.SOL_SOCKET, _SO_MARK, up["mark"])
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            s.setblocking(False)
+            await asyncio.wait_for(asyncio.get_running_loop().sock_connect(s, (ip, up["port"])),
+                                   FAST_CONNECT_TIMEOUT)
+        except BaseException:
+            s.close()
+            raise
+        return await asyncio.open_connection(sock=s, limit=FAST_CHUNK)
+
+    @staticmethod
+    async def read_replies(reader, has_auth: bool) -> None:
+        g = await reader.readexactly(2)
+        if g[0] != 5 or g[1] != (2 if has_auth else 0):
+            raise RuntimeError(f"прокси выбрал метод авторизации {g[1]}")
+        if has_auth and (await reader.readexactly(2))[1] != 0:
+            raise RuntimeError("прокси отверг логин/пароль")
+        head = await reader.readexactly(4)
+        if head[1] != 0:
+            raise RuntimeError(f"прокси отклонил CONNECT, код {head[1]}")
+        if head[3] == 1:
+            await reader.readexactly(6)
+        elif head[3] == 4:
+            await reader.readexactly(18)
+        elif head[3] == 3:
+            await reader.readexactly((await reader.readexactly(1))[0] + 2)
+        else:
+            raise RuntimeError(f"неизвестный ATYP {head[3]} в ответе прокси")
+
+    # ── соединение ──
+    async def handle(self, creader, cwriter):
+        self.stats["active"] += 1
+        self.stats["total"] += 1
+        stage = "local"
+        uwriter = None
+        tasks = []
+        try:
+            up = self.upstream()
+            has_auth = bool(up["user"] and up["password"])
+
+            # 1. Рукопожатие с sing-box по loopback.
+            ver, n = await asyncio.wait_for(creader.readexactly(2), 10)
+            methods = await creader.readexactly(n)
+            method = 2 if has_auth else 0
+            if ver != 5 or method not in methods:
+                cwriter.write(b"\x05\xff")
+                return
+            cwriter.write(bytes([5, method]))
+            if has_auth:
+                ulen = (await creader.readexactly(2))[1]
+                user = await creader.readexactly(ulen)
+                pw = await creader.readexactly((await creader.readexactly(1))[0])
+                if user != up["user"].encode() or pw != up["password"].encode():
+                    cwriter.write(b"\x01\x01")
+                    return
+                cwriter.write(b"\x01\x00")
+            head = await creader.readexactly(4)
+            if head[3] == 1:
+                addr = await creader.readexactly(4)
+            elif head[3] == 4:
+                addr = await creader.readexactly(16)
+            elif head[3] == 3:
+                alen = await creader.readexactly(1)
+                addr = alen + await creader.readexactly(alen[0])
+            else:
+                return
+            addr += await creader.readexactly(2)
+            if head[0] != 5 or head[1] != 1:
+                cwriter.write(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
+                return
+
+            # 2. Подтверждаем CONNECT сразу, параллельно открываем TCP до прокси
+            #    и ждём первые данные клиента: sing-box отдаёт их сразу за ответом.
+            cwriter.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+            await cwriter.drain()
+            stage = "connect"
+            connect = asyncio.ensure_future(self.open_upstream(up))
+            first = asyncio.ensure_future(creader.read(FAST_CHUNK))
+            tasks += [connect, first]
+            await asyncio.wait({connect, first}, return_when=asyncio.FIRST_COMPLETED)
+            if not first.done():
+                # TCP готов раньше данных: ещё чуть-чуть, потом шлём без них
+                # (протоколы, где первым говорит сервер: SMTP, SSH…).
+                await asyncio.wait({first}, timeout=FAST_EARLY_WAIT)
+            if not first.done():
+                first.cancel()
+                try:
+                    await first
+                except asyncio.CancelledError:
+                    pass
+            early = b""
+            if not first.cancelled():
+                early = first.result()
+                if not early:
+                    return          # клиент закрылся, ничего не прислав
+                self.stats["early_data"] += 1
+            ureader, uwriter = await connect
+
+            # 3. Всё рукопожатие с прокси — одним пакетом.
+            stage = "handshake"
+            uwriter.write(socks5_hello(up["user"], up["password"])
+                          + b"\x05\x01\x00" + head[3:4] + addr + early)
+            await uwriter.drain()
+            await asyncio.wait_for(self.read_replies(ureader, has_auth), FAST_REPLY_TIMEOUT)
+
+            stage = "relay"
+            await self.pipe(creader, cwriter, ureader, uwriter)
+        except Exception as e:
+            if stage != "relay":
+                self.stats["failed"] += 1
+                self.log_failure(stage, e)
+            self.abort(cwriter)
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            for w in (cwriter, uwriter):
+                if w is not None:
+                    try:
+                        w.close()
+                    except Exception:
+                        pass
+            self.stats["active"] -= 1
+
+    async def pipe(self, creader, cwriter, ureader, uwriter) -> None:
+        moved = {"up": 0, "down": 0}
+
+        async def copy(src, dst, key):
+            while True:
+                data = await src.read(FAST_CHUNK)
+                if not data:
+                    break
+                moved[key] += len(data)
+                dst.write(data)
+                await dst.drain()
+            if dst.can_write_eof():
+                try:
+                    dst.write_eof()
+                except OSError:
+                    pass
+
+        t_up = asyncio.ensure_future(copy(creader, uwriter, "up"))
+        t_down = asyncio.ensure_future(copy(ureader, cwriter, "down"))
+        try:
+            done, pending = await asyncio.wait({t_up, t_down},
+                                               return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                t.result()          # ошибка одной стороны рвёт обе
+            if pending:
+                # Полузакрытое соединение: держим, пока в оставшуюся сторону
+                # что-то идёт, и закрываем после долгой тишины.
+                other = pending.pop()
+                key = "down" if other is t_down else "up"
+                last = -1
+                while not other.done() and moved[key] != last:
+                    last = moved[key]
+                    await asyncio.wait({other}, timeout=FAST_IDLE_HALF_OPEN)
+                if other.done():
+                    other.result()
+        except Exception:
+            self.abort(cwriter)
+            self.abort(uwriter)
+        finally:
+            for t in (t_up, t_down):
+                if not t.done():
+                    t.cancel()
+
+    @staticmethod
+    def abort(writer) -> None:
+        """Закрыть с RST, а не FIN: клиент должен увидеть обрыв, а не
+        «сервер вежливо закрыл соединение»."""
+        if writer is None:
+            return
+        try:
+            sock = writer.get_extra_info("socket")
+            if sock is not None:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            writer.transport.abort()
+        except Exception:
+            pass
+
+    def log_failure(self, stage: str, e: Exception) -> None:
+        key = f"{stage}:{type(e).__name__}"
+        now = time.time()
+        if now - self._last_log.get(key, 0) >= 10:
+            self._last_log[key] = now
+            log.warning(f"fast-relay: сбой на шаге {stage}: {type(e).__name__}: {e} "
+                        f"(всего сбоев {self.stats['failed']})")
+
+    @staticmethod
+    def raise_fd_limit() -> None:
+        """systemd даёт сервису мягкий лимит 1024 дескриптора (проверено на коробке:
+        1024/524288), а ретранслятор тратит по два на соединение — со всех
+        устройств сети это ~500 одновременных TCP, дальше «Too many open files».
+        Юнит на уже развёрнутых коробках Update не обновляет, поэтому поднимаем
+        мягкий лимит до жёсткого сами — для этого привилегии не нужны."""
+        try:
+            import resource
+        except ImportError:
+            return                      # не Linux (локальные тесты)
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = 65536 if hard == resource.RLIM_INFINITY else min(hard, 65536)
+        if soft < target:
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+                log.info(f"fast-relay: лимит дескрипторов {soft} → {target}")
+            except (ValueError, OSError) as e:
+                log.warning(f"fast-relay: не удалось поднять лимит дескрипторов ({soft}): {e}")
+
+    def serve_forever(self) -> None:
+        self.raise_fd_limit()
+        while True:
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(asyncio.start_server(
+                    self.handle, FAST_RELAY_HOST, FAST_RELAY_PORT, backlog=1024))
+                self.listening = True
+                log.info(f"fast-relay: слушаю {FAST_RELAY_HOST}:{FAST_RELAY_PORT}")
+                loop.run_forever()
+            except Exception as e:
+                log.error(f"fast-relay: остановился ({type(e).__name__}: {e}), перезапуск через 2 с")
+            finally:
+                self.listening = False
+                loop.close()
+            time.sleep(2)
+
+
+FAST_RELAY = FastRelay()
 
 
 # Параметры health-теста пропускной способности
@@ -871,6 +1292,7 @@ async def set_proxy(req: ProxyRequest):
             user=proxy["user"], password=proxy["password"],
             udp_supported=caps["udp_supported"],
             dns_mode=caps["dns_mode"], dns_server=caps["dns_server"],
+            fast_relay=caps["pipelining"],
         )
         log.info("Конфиг записан, перезапуск sing-box в фоне…")
         def restart_in_bg():
@@ -887,6 +1309,7 @@ async def set_proxy(req: ProxyRequest):
             "udp_supported": caps["udp_supported"],
             "dns_mode": caps["dns_mode"],
             "dns_server": caps["dns_server"],
+            "fast_relay": caps["pipelining"],
         }
     except Exception as e:
         log.error(f"Ошибка применения прокси: {e}")
@@ -909,12 +1332,14 @@ async def set_quic(block_quic: bool):
                                      PROBE_TIMEOUT)
         # dns_mode берём из конфига, а не пробуем заново: разовый сбой пробы
         # сбросил бы DoH на :53 и положил прокси, которому :53 закрыт.
+        # fast_relay — туда же, по той же причине.
         write_singbox_conf(
             ip=proxy_data["ip"], port=proxy_data["port"],
             user=proxy_data["user"], password=proxy_data["password"],
             udp_supported=udp_ok,
             block_quic=block_quic,
             dns_mode=proxy_data["dns_mode"], dns_server=proxy_data["dns_server"],
+            fast_relay=proxy_data["fast_relay"],
         )
         log.info("Конфиг записан, перезапуск sing-box в фоне…")
         def restart_in_bg():
@@ -1257,6 +1682,7 @@ async def status():
     mode = "bypass"
     quic_effective = False
     dns_mode = None
+    fast_enabled = False
     try:
         conf = json.load(open(SINGBOX_CONF))
         for srv in conf.get("dns", {}).get("servers", []):
@@ -1267,7 +1693,8 @@ async def status():
             if ob.get("tag") == "proxy":
                 proxy = f"{ob['server']}:{ob['server_port']}"
                 mode = "proxy"
-                break
+            elif ob.get("tag") == "proxy-fast":
+                fast_enabled = True
         # Есть ли правило блокировки QUIC в маршрутах — это ФАКТ, а не выбор
         # пользователя: правило могло появиться и автоматически, из-за прокси
         # без UDP ASSOCIATE.
@@ -1292,6 +1719,9 @@ async def status():
         "quic_blocked":   read_quic_pref(),
         "quic_effective": quic_effective,
         "dns_mode": dns_mode,
+        # enabled — ускоритель в конфиге; listening — поток в этом процессе жив.
+        "fast_relay": dict(FAST_RELAY.stats, enabled=fast_enabled,
+                           listening=FAST_RELAY.listening),
     }
 
 

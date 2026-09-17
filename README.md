@@ -45,7 +45,7 @@ Technical Router  (WAN = DHCP from 10.0.0.1)
 **Traffic flow:**
 1. Device sends any DNS query → `iptables PREROUTING` TProxy → **sing-box** intercepts and answers with a **FakeIP** (198.18.x.x), stores the FakeIP↔domain mapping
 2. Device connects to FakeIP via TCP/UDP → `iptables PREROUTING` TProxy → **sing-box** maps FakeIP back to the real domain, dials the SOCKS5 proxy **by hostname** (no IP leaks through DNS)
-3. For TCP: sing-box opens a SOCKS5 CONNECT tunnel to the proxy
+3. For TCP: sing-box opens a SOCKS5 CONNECT tunnel to the proxy through the built-in **fast relay** (`127.0.0.1:7894`, part of `server.py`), which sends greeting, login, CONNECT and the client's first bytes to the proxy in one packet: ~320 ms less per new connection at ~100 ms RTT. It is enabled only for proxies that pass a pipelining probe; the others use sing-box's own step-by-step handshake
 4. For UDP (QUIC, STUN, etc.): sing-box uses **SOCKS5 UDP ASSOCIATE** — the proxy forwards UDP datagrams, so QUIC/HTTP3 reaches the destination through the proxy IP
 5. IPv6 → `ip6tables FORWARD DROP`
 
@@ -335,7 +335,7 @@ Ubuntu-ноутбук  ◄──────── LAN ────────�
 **Путь трафика:**
 1. Устройство отправляет DNS-запрос → `iptables PREROUTING` TProxy → **sing-box** перехватывает и отвечает **FakeIP** (198.18.x.x), сохраняя маппинг FakeIP↔домен
 2. Устройство подключается к FakeIP по TCP/UDP → `iptables PREROUTING` TProxy → **sing-box** находит домен по FakeIP и дозванивается в SOCKS5 прокси **по имени хоста** (не по IP — утечка исключена)
-3. Для TCP: sing-box открывает SOCKS5 CONNECT тоннель к прокси
+3. Для TCP: sing-box открывает SOCKS5 CONNECT тоннель к прокси через встроенный **ускоритель рукопожатия** (`127.0.0.1:7894`, часть `server.py`). Он отправляет прокси приветствие, логин, CONNECT и первые данные клиента одним пакетом: при RTT ~100 мс это примерно на 320 мс быстрее на каждое новое соединение. Включается только для прокси, прошедших пробу; остальные работают на обычном пошаговом рукопожатии sing-box
 4. Для UDP (QUIC, STUN и др.): sing-box использует **SOCKS5 UDP ASSOCIATE** — прокси транзитирует UDP-датаграммы, QUIC/HTTP3 доходит до назначения через IP прокси
 5. IPv6 → `ip6tables FORWARD DROP`
 
