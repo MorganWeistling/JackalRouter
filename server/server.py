@@ -115,6 +115,58 @@ def _dns_query(name: str = "example.com") -> bytes:
     return q + b"\x00\x00\x01\x00\x01"
 
 
+_SO_MARK = getattr(socket, "SO_MARK", 36)   # 36 — значение из linux/socket.h
+
+
+def routing_mark_of(outbound: dict) -> int:
+    mark = outbound.get("routing_mark") or 0
+    return int(mark, 0) if isinstance(mark, str) else int(mark)
+
+
+def proxy_routing_mark() -> int:
+    """routing_mark outbound'а "proxy" из текущего config.json (0, если его нет).
+
+    Пробы и тесты обязаны ходить к прокси тем же маршрутом, что sing-box и
+    FastRelay. На коробке с маршрутизацией по метке (локальный патч ставит 100 →
+    VPN-туннель) прямой путь ведёт себя совсем иначе: проверено — без метки
+    /proxy_health вставал на ~17 КБ и показывал «мёртвый прокси», хотя трафик
+    устройств через тот же прокси шёл нормально."""
+    try:
+        with open(SINGBOX_CONF) as f:
+            conf = json.load(f)
+        for ob in conf.get("outbounds", []):
+            if ob.get("tag") == "proxy":
+                return routing_mark_of(ob)
+    except Exception:
+        pass
+    return 0
+
+
+def apply_proxy_mark(sock: socket.socket, mark: int) -> None:
+    if mark and sys.platform.startswith("linux"):
+        sock.setsockopt(socket.SOL_SOCKET, _SO_MARK, mark)
+
+
+def connect_to_proxy(host: str, port: int, timeout: float) -> socket.socket:
+    """socket.create_connection, но с routing_mark прокси (см. proxy_routing_mark)."""
+    mark = proxy_routing_mark()
+    if not mark:
+        return socket.create_connection((host, port), timeout=timeout)
+    err = None
+    for af, kind, proto, _, addr in socket.getaddrinfo(host, port, socket.AF_INET,
+                                                       socket.SOCK_STREAM):
+        s = socket.socket(af, kind, proto)
+        try:
+            apply_proxy_mark(s, mark)
+            s.settimeout(timeout)
+            s.connect(addr)
+            return s
+        except OSError as e:
+            s.close()
+            err = e
+    raise err or OSError(f"не удалось подключиться к {host}:{port}")
+
+
 def _recv_exact(sock: socket.socket, n: int, timeout: float) -> bytes:
     """recv() возвращает столько, сколько пришло, а не сколько попросили.
     Для SOCKS5-ответа это обычно сходит с рук, но если сразу за ним идёт
@@ -145,7 +197,7 @@ def check_udp_associate(ip: str, port: int, user: str, password: str,
     тихого зависания)."""
     t = u = None
     try:
-        t = socket.create_connection((ip, port), timeout=timeout)
+        t = connect_to_proxy(ip, port, timeout)
         t.settimeout(timeout)
         has_auth = bool(user and password)
         methods = b"\x02" if has_auth else b"\x00"
@@ -170,6 +222,7 @@ def check_udp_associate(ip: str, port: int, user: str, password: str,
         pkt = b"\x00\x00\x00\x01" + socket.inet_aton(PROXY_DNS_IP) \
             + struct.pack("!H", 53) + _dns_query()
         u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        apply_proxy_mark(u, proxy_routing_mark())     # UDP sing-box идёт с той же меткой
         u.settimeout(timeout)
         u.sendto(pkt, (bnd_ip, bnd_port))
         data, _ = u.recvfrom(2048)
@@ -620,7 +673,7 @@ def http_get_via_socks(host: str, port: int, user: str, password: str,
                        timeout: int = 15) -> bytes:
     """Простой HTTP GET через SOCKS5-прокси (raw, без сторонних зависимостей).
     Используем HTTP/1.0 + Connection: close — ответ без chunked, читаем до EOF."""
-    s = socket.create_connection((host, port), timeout=timeout)
+    s = connect_to_proxy(host, port, timeout)
     try:
         s.settimeout(timeout)
         has_auth = bool(user and password)
@@ -665,7 +718,7 @@ def http_get_via_socks(host: str, port: int, user: str, password: str,
 def socks5_connect(host: str, port: int, user: str, password: str,
                    target_host: str, target_port: int, timeout: int = 12) -> socket.socket:
     """SOCKS5 рукопожатие + CONNECT к target. Возвращает открытый сокет."""
-    s = socket.create_connection((host, port), timeout=timeout)
+    s = connect_to_proxy(host, port, timeout)
     s.settimeout(timeout)
     has_auth = bool(user and password)
     methods = b"\x02" if has_auth else b"\x00"
@@ -803,7 +856,7 @@ def probe_socks_pipelining(ip: str, port: int, user: str, password: str,
         except ssl.SSLWantReadError:
             pass
         has_auth = bool(user and password)
-        s = socket.create_connection((ip, port), timeout=timeout)
+        s = connect_to_proxy(ip, port, timeout)
         s.sendall(socks5_hello(user, password)
                   + b"\x05\x01\x00\x01" + socket.inet_aton(PROXY_DNS_IP) + struct.pack("!H", 443)
                   + outgoing.read())
@@ -904,7 +957,6 @@ FAST_CONNECT_TIMEOUT = 10
 FAST_REPLY_TIMEOUT   = 15
 FAST_IDLE_HALF_OPEN  = 300    # после EOF с одной стороны: закрыть, если другая молчит столько секунд
 FAST_CHUNK           = 65536
-_SO_MARK = getattr(socket, "SO_MARK", 36)   # 36 — значение из linux/socket.h
 
 
 class FastRelay:
@@ -944,7 +996,6 @@ class FastRelay:
             conf = json.load(f)
         for ob in conf.get("outbounds", []):
             if ob.get("tag") == "proxy":
-                mark = ob.get("routing_mark") or 0
                 up = {
                     "server":   ob["server"],
                     "port":     int(ob["server_port"]),
@@ -952,7 +1003,7 @@ class FastRelay:
                     "password": ob.get("password", ""),
                     # Метку пути к прокси уважаем так же, как sing-box: без неё
                     # трафик ушёл бы другим маршрутом, чем UDP того же прокси.
-                    "mark":     int(mark, 0) if isinstance(mark, str) else int(mark),
+                    "mark":     routing_mark_of(ob),
                 }
                 self._upstream = (mtime, up)
                 return up
@@ -977,8 +1028,7 @@ class FastRelay:
         ip = await self.resolve(up["server"])
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            if up["mark"] and sys.platform.startswith("linux"):
-                s.setsockopt(socket.SOL_SOCKET, _SO_MARK, up["mark"])
+            apply_proxy_mark(s, up["mark"])
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             s.setblocking(False)
             await asyncio.wait_for(asyncio.get_running_loop().sock_connect(s, (ip, up["port"])),
