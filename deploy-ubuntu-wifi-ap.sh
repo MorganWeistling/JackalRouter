@@ -592,7 +592,7 @@ info "Определяю последнюю версию sing-box..."
 SINGBOX_VERSION=$(curl -s --max-time 20 https://api.github.com/repos/SagerNet/sing-box/releases/latest \
     2>/dev/null | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/' | head -1 || true)
 if [ -z "${SINGBOX_VERSION:-}" ]; then
-    SINGBOX_VERSION="1.13.13"
+    SINGBOX_VERSION="1.14.1"
     warn "GitHub API не ответил — беру проверенную версию $SINGBOX_VERSION."
     warn "Само по себе это сигнал, что у коробки проблемы с доступом в сеть."
 else

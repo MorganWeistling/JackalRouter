@@ -473,7 +473,7 @@ step 7 "Установка sing-box (ARM64) и JackalRouter"
 info "Определяю последнюю версию sing-box..."
 SINGBOX_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest \
     2>/dev/null | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/' | head -1 || true)
-[ -z "${SINGBOX_VERSION:-}" ] && SINGBOX_VERSION="1.13.13"
+[ -z "${SINGBOX_VERSION:-}" ] && SINGBOX_VERSION="1.14.1"
 ok "sing-box v${SINGBOX_VERSION}  (сборка linux-${SB_ARCH})"
 
 info "Скачиваю sing-box для ${SB_ARCH}..."

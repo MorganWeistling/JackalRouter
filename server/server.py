@@ -6,6 +6,7 @@ JackalRouter — FastAPI-сервер для Ubuntu
 """
 
 import asyncio
+import collections
 import subprocess
 import json
 import re
@@ -67,6 +68,7 @@ async def lifespan(app: FastAPI):
     if os.geteuid() != 0:
         log.warning("Сервер запущен НЕ от root — правила iptables могут не примениться!")
     apply_iptables()
+    ensure_singbox_conf_compat()
     # Свой поток и свой event loop: часть эндпоинтов блокирующая (пробы до 9 с,
     # health-тест до 25 с), в общем цикле uvicorn они замораживали бы весь трафик.
     threading.Thread(target=FAST_RELAY.serve_forever, name="fast-relay", daemon=True).start()
@@ -167,6 +169,44 @@ def connect_to_proxy(host: str, port: int, timeout: float) -> socket.socket:
     raise err or OSError(f"не удалось подключиться к {host}:{port}")
 
 
+SOCKS5_ASSOCIATE_ANY = b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00"   # «слать буду с любого адреса»
+
+
+def socks5_hello(user: str, password: str) -> bytes:
+    """Приветствие SOCKS5 и, если есть логин, авторизация — одним куском.
+    Метод предлагаем ровно один, как и sing-box: иначе сервер мог бы выбрать
+    «без авторизации», и отправленные следом логин/пароль он прочитал бы как
+    CONNECT."""
+    if user and password:
+        u, p = user.encode(), password.encode()
+        return b"\x05\x01\x02\x01" + bytes([len(u)]) + u + bytes([len(p)]) + p
+    return b"\x05\x01\x00"
+
+
+SINGBOX_BIN = "/usr/local/bin/sing-box"
+_singbox_version_cache = {}
+
+
+def singbox_version() -> tuple:
+    """Версия установленного sing-box, (1, 14, 1); () если не удалось узнать.
+    Кэш привязан к mtime бинарника — после его замены версия перечитается."""
+    try:
+        mtime = os.stat(SINGBOX_BIN).st_mtime_ns
+        if mtime not in _singbox_version_cache:
+            out = subprocess.run([SINGBOX_BIN, "version"], capture_output=True,
+                                 text=True, timeout=10).stdout
+            m = re.search(r"version (\d+)\.(\d+)\.(\d+)", out)
+            _singbox_version_cache.clear()
+            _singbox_version_cache[mtime] = tuple(int(x) for x in m.groups()) if m else ()
+        return _singbox_version_cache[mtime]
+    except Exception:
+        return ()
+
+
+def singbox_has_dns_optimistic() -> bool:
+    return singbox_version() >= (1, 14, 0)
+
+
 def _recv_exact(sock: socket.socket, n: int, timeout: float) -> bytes:
     """recv() возвращает столько, сколько пришло, а не сколько попросили.
     Для SOCKS5-ответа это обычно сходит с рук, но если сразу за ним идёт
@@ -182,8 +222,11 @@ def _recv_exact(sock: socket.socket, n: int, timeout: float) -> bytes:
 
 
 def check_udp_associate(ip: str, port: int, user: str, password: str,
-                        timeout: int = 6) -> bool:
+                        timeout: int = 6, pipelined: bool = False) -> bool:
     """Проверяет, поддерживает ли апстрим-прокси SOCKS5 UDP ASSOCIATE.
+
+    pipelined=True — то же, но приветствие + логин + ASSOCIATE одним пакетом,
+    как это делает FastRelay: только при успехе UDP пускается через него.
 
     Обнаружено на живой коробке: часть мобильных/резидентных прокси отклоняет
     команду ASSOCIATE кодом 7 ("Command not supported"). Без этой проверки
@@ -200,21 +243,32 @@ def check_udp_associate(ip: str, port: int, user: str, password: str,
         t = connect_to_proxy(ip, port, timeout)
         t.settimeout(timeout)
         has_auth = bool(user and password)
-        methods = b"\x02" if has_auth else b"\x00"
-        t.sendall(b"\x05" + bytes([len(methods)]) + methods)
-        resp = t.recv(2)
-        if len(resp) < 2 or resp[0] != 5 or resp[1] == 0xFF:
-            return False
-        if resp[1] == 2:
-            uu, pp = user.encode(), password.encode()
-            t.sendall(b"\x01" + bytes([len(uu)]) + uu + bytes([len(pp)]) + pp)
-            resp = t.recv(2)
-            if len(resp) < 2 or resp[1] != 0:
+        if pipelined:
+            t.sendall(socks5_hello(user, password) + SOCKS5_ASSOCIATE_ANY)
+            g = _recv_exact(t, 2, timeout)
+            if g[0] != 5 or g[1] != (2 if has_auth else 0):
                 return False
-        t.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
-        resp = t.recv(10)
-        if len(resp) < 10 or resp[1] != 0:
-            return False  # code=7 (Command not supported) и подобные — сюда
+            if has_auth and _recv_exact(t, 2, timeout)[1] != 0:
+                return False
+            resp = _recv_exact(t, 10, timeout)
+            if resp[1] != 0 or resp[3] != 1:
+                return False
+        else:
+            methods = b"\x02" if has_auth else b"\x00"
+            t.sendall(b"\x05" + bytes([len(methods)]) + methods)
+            resp = t.recv(2)
+            if len(resp) < 2 or resp[0] != 5 or resp[1] == 0xFF:
+                return False
+            if resp[1] == 2:
+                uu, pp = user.encode(), password.encode()
+                t.sendall(b"\x01" + bytes([len(uu)]) + uu + bytes([len(pp)]) + pp)
+                resp = t.recv(2)
+                if len(resp) < 2 or resp[1] != 0:
+                    return False
+            t.sendall(SOCKS5_ASSOCIATE_ANY)
+            resp = t.recv(10)
+            if len(resp) < 10 or resp[1] != 0:
+                return False  # code=7 (Command not supported) и подобные — сюда
         bnd_ip = socket.inet_ntoa(resp[4:8])
         bnd_port = struct.unpack("!H", resp[8:10])[0]
         if bnd_ip in ("0.0.0.0", "127.0.0.1"):
@@ -241,7 +295,11 @@ def check_udp_associate(ip: str, port: int, user: str, password: str,
 def make_singbox_conf(ip: str, port: int, user: str, password: str,
                       udp_supported: bool = True, block_quic: bool = False,
                       dns_mode: str = "tcp53", dns_server: str = PROXY_DNS_IP,
-                      fast_relay: bool = False) -> dict:
+                      fast_relay: bool = False, fast_udp: bool = False,
+                      dns_optimistic: bool = False) -> dict:
+    # fast_udp — UDP тоже через ретранслятор. Только поверх fast_relay и только
+    # для прокси, у которого UDP ASSOCIATE вообще работает.
+    fast_udp = fast_udp and fast_relay and udp_supported
     # Если upstream-прокси не поддерживает SOCKS5 UDP ASSOCIATE, QUIC/HTTP3
     # нельзя безопасно запускать через него: это гарантированно приводит к
     # зависанию/залипанию QUIC-хендшейка. Делаем явный запрет QUIC не только
@@ -260,8 +318,8 @@ def make_singbox_conf(ip: str, port: int, user: str, password: str,
     proxy_is_domain = not _is_ip_literal(ip)
 
     # Весь TCP (включая резолвер) идёт через локальный ускоритель рукопожатия,
-    # если апстрим его выдерживает (probe_socks_pipelining). UDP ASSOCIATE
-    # ускоритель не умеет — UDP остаётся на обычном socks-outbound "proxy".
+    # если апстрим его выдерживает (probe_socks_pipelining). UDP — через него же
+    # только при fast_udp, иначе остаётся на обычном socks-outbound "proxy".
     tcp_out = "proxy-fast" if fast_relay else "proxy"
 
     # Транспорт резолвера, который ходит ЧЕРЕЗ прокси. Тег "proxy-dns" одинаков
@@ -329,7 +387,7 @@ def make_singbox_conf(ip: str, port: int, user: str, password: str,
     # долетает уже готовый IP. Стоит последним, чтобы все правила выше
     # (direct/block по домену) успели отработать на оригинальном домене.
     route_rules.append({"action": "resolve", "strategy": "ipv4_only"})
-    if fast_relay:
+    if fast_relay and not fast_udp:
         route_rules.append({"network": "udp", "outbound": "proxy"})
 
     socks_out = {
@@ -374,19 +432,28 @@ def make_singbox_conf(ip: str, port: int, user: str, password: str,
         {"type": "block",  "tag": "block"},
     ]
 
+    dns = {
+        "servers": [
+            {"type": "fakeip", "tag": "fakeip", "inet4_range": "198.18.0.0/15"},
+            proxy_dns_server,
+            # Без detour — используется только для адреса самого прокси
+            {"type": "tcp", "tag": "direct-dns", "server": PROXY_DNS_IP},
+        ],
+        "rules": dns_rules,
+        "final": "proxy-dns",
+        "strategy": "ipv4_only",
+    }
+    if dns_optimistic:
+        # sing-box >= 1.14: просроченный ответ отдаётся сразу, обновление — в
+        # фоне. Правило "resolve" перед каждым соединением перестаёт ждать
+        # резолвер на повторных визитах. Кэш только в памяти (store_dns не
+        # включаем), а sing-box перезапускается при каждой смене прокси —
+        # адреса, полученные через прошлый прокси, не переживают смену.
+        dns["optimistic"] = True
+
     return {
         "log": {"level": "info"},
-        "dns": {
-            "servers": [
-                {"type": "fakeip", "tag": "fakeip", "inet4_range": "198.18.0.0/15"},
-                proxy_dns_server,
-                # Без detour — используется только для адреса самого прокси
-                {"type": "tcp", "tag": "direct-dns", "server": PROXY_DNS_IP},
-            ],
-            "rules": dns_rules,
-            "final": "proxy-dns",
-            "strategy": "ipv4_only",
-        },
+        "dns": dns,
         "inbounds": [{
             "type": "tproxy",
             "tag": "tproxy-in",
@@ -498,23 +565,49 @@ def read_quic_pref() -> bool:
 def write_singbox_conf(ip: str, port: int, user: str, password: str,
                        udp_supported: bool = True, block_quic: bool = False,
                        dns_mode: str = "tcp53", dns_server: str = PROXY_DNS_IP,
-                       fast_relay=None):
-    # fast_relay=None — решаем пробой здесь же. Так ускоритель включается и там,
-    # где вызывающий про него не знает: код перегенерации в update.py и в
+                       fast_relay=None, fast_udp=None):
+    # None — решаем пробой здесь же. Так ускоритель включается и там, где
+    # вызывающий про него не знает: код перегенерации в update.py и в
     # /self_update ПРЕДЫДУЩЕЙ версии (он исполняется старым процессом).
     if fast_relay is None:
         fast_relay = probe_socks_pipelining(ip, port, user, password)
+    if fast_udp is None:
+        fast_udp = bool(fast_relay and udp_supported and check_udp_associate(
+            ip, port, user, password, PROBE_TIMEOUT, pipelined=True))
+    dns_optimistic = singbox_has_dns_optimistic()
     os.makedirs(os.path.dirname(SINGBOX_CONF), exist_ok=True)
     conf = make_singbox_conf(ip, port, user, password, udp_supported=udp_supported,
                              block_quic=block_quic, dns_mode=dns_mode, dns_server=dns_server,
-                             fast_relay=fast_relay)
+                             fast_relay=fast_relay, fast_udp=fast_udp,
+                             dns_optimistic=dns_optimistic)
     with open(SINGBOX_CONF, "w") as f:
         json.dump(conf, f, indent=2)
     # Запоминаем именно ВЫБОР пользователя, а не итоговую блокировку.
     write_state(block_quic=bool(block_quic))
     log.info(f"Записан {SINGBOX_CONF}  [{ip}:{port}]  udp_supported={udp_supported}  "
              f"block_quic={block_quic}  effective_block_quic={block_quic or not udp_supported}  "
-             f"dns={dns_mode}:{dns_server}  fast_relay={fast_relay}")
+             f"dns={dns_mode}:{dns_server}  fast_relay={fast_relay}  "
+             f"fast_udp={bool(fast_udp and fast_relay and udp_supported)}  "
+             f"dns_optimistic={dns_optimistic}")
+
+
+def ensure_singbox_conf_compat() -> None:
+    """Конфиг с полем, которого не знает установленный sing-box, не загрузится
+    вовсе — это полный простой. Такое бывает после отката бинарника (например,
+    деплой-скрипт взял запасную версию). При старте убираем такие поля."""
+    try:
+        with open(SINGBOX_CONF) as f:
+            conf = json.load(f)
+    except Exception:
+        return
+    dns = conf.get("dns", {})
+    if "optimistic" in dns and not singbox_has_dns_optimistic():
+        dns.pop("optimistic")
+        with open(SINGBOX_CONF, "w") as f:
+            json.dump(conf, f, indent=2)
+        log.warning(f"sing-box {singbox_version()} не знает dns.optimistic — убрал из "
+                    f"конфига, перезапускаю sing-box")
+        run("systemctl restart sing-box")
 
 
 def write_singbox_bypass_conf():
@@ -637,6 +730,16 @@ def err_code(msg: str) -> str:
     return "other"
 
 
+def config_fast_paths(conf: dict) -> Tuple[bool, bool]:
+    """(TCP через ретранслятор, UDP через ретранслятор) — прямо из конфига.
+    UDP идёт через него, если есть proxy-fast, а отдельного правила
+    «UDP → proxy» нет."""
+    fast = any(ob.get("tag") == "proxy-fast" for ob in conf.get("outbounds", []))
+    udp_to_proxy = any(r.get("network") == "udp" and r.get("outbound") == "proxy"
+                       for r in conf.get("route", {}).get("rules", []))
+    return fast, fast and not udp_to_proxy
+
+
 def read_active_proxy() -> dict:
     """Достаёт активный прокси (ip/port/user/pass) из текущего config.json sing-box,
     плюс режим резолвера. Источник истины — сам конфиг, отдельного файла состояния
@@ -653,7 +756,7 @@ def read_active_proxy() -> dict:
             break
 
     outbounds = conf.get("outbounds", [])
-    fast_relay = any(ob.get("tag") == "proxy-fast" for ob in outbounds)
+    fast_relay, fast_udp = config_fast_paths(conf)
     for ob in outbounds:
         if ob.get("tag") == "proxy":
             return {
@@ -664,6 +767,7 @@ def read_active_proxy() -> dict:
                 "dns_mode":   dns_mode,
                 "dns_server": dns_server,
                 "fast_relay": fast_relay,
+                "fast_udp":   fast_udp,
             }
     raise RuntimeError("no proxy outbound (tag=proxy) in config.json")
 
@@ -825,17 +929,6 @@ def probe_dns_doh(ip: str, port: int, user: str, password: str,
             pass
 
 
-def socks5_hello(user: str, password: str) -> bytes:
-    """Приветствие SOCKS5 и, если есть логин, авторизация — одним куском.
-    Метод предлагаем ровно один, как и sing-box: иначе сервер мог бы выбрать
-    «без авторизации», и отправленные следом логин/пароль он прочитал бы как
-    CONNECT."""
-    if user and password:
-        u, p = user.encode(), password.encode()
-        return b"\x05\x01\x02\x01" + bytes([len(u)]) + u + bytes([len(p)]) + p
-    return b"\x05\x01\x00"
-
-
 def probe_socks_pipelining(ip: str, port: int, user: str, password: str,
                            timeout: int = PROBE_TIMEOUT) -> bool:
     """Выдерживает ли апстрим рукопожатие одним пакетом — ровно то, что делает
@@ -903,12 +996,13 @@ def probe_proxy(ip: str, port: int, user: str, password: str) -> dict:
     TIMEOUT=15 с, а последовательно (UDP + :53 + DoH) в этот бюджет не влезть.
     Кто не уложился — считается неподдержанным: консервативный ответ безопаснее."""
     t_end = time.time() + PROBE_DEADLINE
-    ex = cf.ThreadPoolExecutor(max_workers=4)
+    ex = cf.ThreadPoolExecutor(max_workers=5)
     try:
         f_udp   = ex.submit(check_udp_associate, ip, port, user, password, PROBE_TIMEOUT)
         f_tcp53 = ex.submit(probe_dns_tcp53, ip, port, user, password, PROXY_DNS_IP, PROBE_TIMEOUT)
         f_doh   = ex.submit(probe_dns_doh,   ip, port, user, password, PROXY_DNS_IP, PROBE_TIMEOUT)
         f_pipe  = ex.submit(probe_socks_pipelining, ip, port, user, password, PROBE_TIMEOUT)
+        f_upipe = ex.submit(check_udp_associate, ip, port, user, password, PROBE_TIMEOUT, True)
 
         def got(fut) -> bool:
             try:
@@ -917,6 +1011,9 @@ def probe_proxy(ip: str, port: int, user: str, password: str) -> dict:
                 return False
 
         udp_ok, tcp53_ok, doh_ok, pipe_ok = got(f_udp), got(f_tcp53), got(f_doh), got(f_pipe)
+        # UDP через ретранслятор — только если прокси умеет UDP вообще и принимает
+        # ASSOCIATE одним пакетом. Прокси без UDP остаётся на прежнем пути.
+        udp_pipe_ok = udp_ok and pipe_ok and got(f_upipe)
     finally:
         # wait=False: не держим ответ ради «опоздавших» проб, их сокеты закроются сами.
         ex.shutdown(wait=False)
@@ -944,10 +1041,11 @@ def probe_proxy(ip: str, port: int, user: str, password: str) -> dict:
 
     log.info(f"Прокси умеет: UDP ASSOCIATE={'да' if udp_ok else 'НЕТ (QUIC заблокирую)'}, "
              f"DNS :53={'да' if tcp53_ok else 'НЕТ'}, DoH :443={'да' if doh_ok else 'нет'}, "
-             f"рукопожатие одним пакетом={'да' if pipe_ok else 'нет'} "
+             f"рукопожатие одним пакетом={'да' if pipe_ok else 'нет'}, "
+             f"UDP через ускоритель={'да' if udp_pipe_ok else 'нет'} "
              f"→ резолвер {dns_mode} через {dns_server}")
     return {"udp_supported": udp_ok, "dns_mode": dns_mode, "dns_server": dns_server,
-            "pipelining": pipe_ok}
+            "pipelining": pipe_ok, "udp_pipelining": udp_pipe_ok}
 
 
 # ── Ускоритель SOCKS5-рукопожатия ────────────────────────────────────────────
@@ -957,6 +1055,117 @@ FAST_CONNECT_TIMEOUT = 10
 FAST_REPLY_TIMEOUT   = 15
 FAST_IDLE_HALF_OPEN  = 300    # после EOF с одной стороны: закрыть, если другая молчит столько секунд
 FAST_CHUNK           = 65536
+FAST_UDP_BUFFER      = 256    # датаграмм sing-box, которые держим, пока ассоциация у прокси не готова
+FAST_UDP_SOCKBUF     = 4 << 20   # буферы UDP-сокетов: QUIC приходит пачками быстрее, чем их разбирает Python
+
+
+def grow_udp_buffers(sock) -> None:
+    """Дефолтные ~200 КБ — это ~170 датаграмм QUIC: пачка переполняет буфер,
+    пока event loop занят. От root net.core.rmem_max обходится *BUFFORCE."""
+    force = {socket.SO_RCVBUF: 33, socket.SO_SNDBUF: 32}      # SO_RCVBUFFORCE / SO_SNDBUFFORCE
+    for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
+        try:
+            if sys.platform.startswith("linux") and os.geteuid() == 0:
+                sock.setsockopt(socket.SOL_SOCKET, force[opt], FAST_UDP_SOCKBUF)
+            else:
+                sock.setsockopt(socket.SOL_SOCKET, opt, FAST_UDP_SOCKBUF)
+        except (OSError, AttributeError):
+            pass
+
+
+class NoUpstream(RuntimeError):
+    """В config.json нет outbound proxy (режим bypass или конфига нет)."""
+
+
+class UpstreamSilent(Exception):
+    """Прокси закрыл соединение, не прислав ни байта ответа."""
+
+
+class _Warm:
+    """Заранее открытое TCP-соединение с прокси, в которое ещё ничего не отправлено."""
+    __slots__ = ("born", "reader", "writer")
+
+    def __init__(self, reader, writer):
+        self.born = time.monotonic()
+        self.reader, self.writer = reader, writer
+
+    def usable(self, max_age: float) -> bool:
+        return (time.monotonic() - self.born < max_age and not self.reader.at_eof()
+                and self.reader.exception() is None and not self.writer.transport.is_closing())
+
+    def close(self) -> None:
+        try:
+            self.writer.close()
+        except Exception:
+            pass
+
+
+class _Assoc:
+    """UDP ASSOCIATE у прокси: управляющее TCP и UDP-сокет, из которого шлём на BND."""
+    __slots__ = ("born", "reader", "writer", "bnd", "udp", "on_reply")
+
+    def __init__(self, reader, writer, bnd):
+        self.born = time.monotonic()
+        self.reader, self.writer, self.bnd = reader, writer, bnd
+        self.udp = None
+        self.on_reply = None          # сессия sing-box, которой отдавать ответы прокси
+
+    def usable(self, max_age: float) -> bool:
+        return (time.monotonic() - self.born < max_age and not self.reader.at_eof()
+                and self.reader.exception() is None and not self.writer.transport.is_closing()
+                and self.udp is not None and not self.udp.is_closing())
+
+    def close(self) -> None:
+        for closer in (self.writer, self.udp):
+            try:
+                if closer is not None:
+                    closer.close()
+            except Exception:
+                pass
+
+
+class _FastUdp:
+    """UDP-сокет, который вычитывается пачками. Датаграммы пересылаются как есть:
+    заголовок SOCKS5 UDP уже внутри, его понимают обе стороны — sing-box и прокси.
+
+    Не asyncio-транспорт: тот забирает одну датаграмму за итерацию цикла, и на
+    потоке QUIC упирается в Python раньше, чем в сеть. Отправка — сразу в сокет;
+    если буфер ядра полон, датаграмма теряется, как потерялась бы в сети."""
+    BATCH = 256
+
+    def __init__(self, loop, sock, on_datagram):
+        self.loop, self.sock, self.on_datagram = loop, sock, on_datagram
+        self.closed = False
+        self.dropped = 0
+        sock.setblocking(False)
+        loop.add_reader(sock.fileno(), self._read)
+
+    def _read(self) -> None:
+        for _ in range(self.BATCH):
+            try:
+                data, addr = self.sock.recvfrom(65535)
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError:
+                continue              # ICMP unreachable и т.п. — датаграмма просто потерялась
+            self.on_datagram(data, addr)
+
+    def sendto(self, data: bytes, addr) -> None:
+        try:
+            self.sock.sendto(data, addr)
+        except (BlockingIOError, InterruptedError):
+            self.dropped += 1
+        except OSError:
+            pass
+
+    def is_closing(self) -> bool:
+        return self.closed
+
+    def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self.loop.remove_reader(self.sock.fileno())
+            self.sock.close()
 
 
 class FastRelay:
@@ -966,34 +1175,70 @@ class FastRelay:
     логин, CONNECT — 4 RTT до прокси на КАЖДОЕ новое соединение (sing
     protocol/socks/handshake.go). Здесь sing-box проходит эти шаги по loopback
     мгновенно, а к прокси уходит один пакет: приветствие + логин + CONNECT +
-    первые данные клиента (обычно TLS ClientHello). Остаются TCP-хендшейк и один
-    обмен. Замерено на живой коробке (RTT до прокси ~98 мс): до первого байта
-    ответа сайта 495 → 198 мс.
+    первые данные клиента (обычно TLS ClientHello).
 
-    CONNECT подтверждается sing-box сразу, до ответа прокси. Если прокси потом
-    откажет, клиент получит RST вместо кода ошибки — sing-box со своим
-    TProxy-входом ведёт себя так же. Включается в конфиге, только если апстрим
-    прошёл probe_socks_pipelining. Умеет только CONNECT: UDP ASSOCIATE идёт
-    мимо, прямо из sing-box.
+    Сверху — два запаса, оба подстраиваются под конкретный прокси:
+      * TCP: заранее открытые соединения, в которые ещё ничего не отправлено.
+        Экономят TCP-хендшейк, остаётся один обмен. Сколько такое соединение
+        живёт у прокси, меряет probe_idle; запас обновляется раньше. Если
+        соединение из запаса всё же умерло к моменту использования — повтор на
+        свежем (данные клиента ещё у нас), а срок жизни запаса сокращается.
+      * UDP: готовые ассоциации. sing-box получает ответ на ASSOCIATE сразу —
+        адрес нашего локального UDP-сокета, — а первые датаграммы (QUIC
+        Initial) уходят к прокси без ожидания. Без готовой ассоциации она
+        создаётся одним пакетом, датаграммы до её готовности буферизуются.
+        UDP идёт через ретранслятор, только если прокси это умеет
+        (check_udp_associate(pipelined=True)); иначе sing-box шлёт UDP сам.
+
+    CONNECT/ASSOCIATE подтверждаются sing-box сразу, до ответа прокси. Если
+    прокси потом откажет, клиент получит RST (или тишину для UDP) вместо кода
+    ошибки — sing-box со своим TProxy-входом ведёт себя так же.
 
     Апстрим (адрес, логин, routing_mark) берётся из outbound "proxy" текущего
     config.json и перечитывается при его изменении — /set_proxy перезапускает
     только sing-box, а не этот процесс."""
 
+    IDLE_CHECKPOINTS = (3, 6, 10, 15, 25)   # секунды простоя, которые проверяет probe_idle
+    POOL_MIN_AGE  = 2.0      # короче — запас TCP не держим: пересоздавать слишком часто
+    POOL_MAX_AGE  = 15.0
+    POOL_IDLE_OFF = 120      # столько секунд без новых TCP — запас не пополняем
+    POOL_REPROBE  = 600      # запас выключился из-за умершего соединения — перемерить через
+    UDP_POOL_AGE  = 30.0     # готовая ассоциация у провайдера жила >60 с без трафика
+    UDP_IDLE_OFF  = 300
+    MAINTAIN_EVERY = 0.5
+
     def __init__(self):
-        self.stats = {"active": 0, "total": 0, "failed": 0, "early_data": 0}
+        self.stats = {"active": 0, "total": 0, "failed": 0, "early_data": 0,
+                      "pool_hits": 0, "pool_retries": 0,
+                      "udp_sessions": 0, "udp_pool_hits": 0, "udp_failed": 0}
         self.listening = False
         self._upstream = None        # (mtime_ns, dict)
         self._resolved = {}          # домен прокси -> (ip, годен_до)
         self._last_log = {}
+        self.pool_key = None
+        self.tcp_pool = []
+        self.tcp_opening = 0
+        self.tcp_max_age = 0.0       # 0 — запас TCP выключен (ещё не измерен или не годится)
+        self.tcp_takes = collections.deque(maxlen=64)
+        self.last_tcp_use = 0.0
+        self.reprobe_at = 0.0
+        self.pool_deaths = collections.deque(maxlen=8)
+        self.udp_pool = []
+        self.udp_opening = 0
+        self.udp_takes = collections.deque(maxlen=64)
+        self.last_udp_use = 0.0
 
     # ── апстрим ──
     def upstream(self) -> dict:
-        mtime = os.stat(SINGBOX_CONF).st_mtime_ns
+        try:
+            mtime = os.stat(SINGBOX_CONF).st_mtime_ns
+        except OSError as e:
+            raise NoUpstream(str(e))
         if self._upstream and self._upstream[0] == mtime:
             return self._upstream[1]
         with open(SINGBOX_CONF) as f:
             conf = json.load(f)
+        fast, fast_udp = config_fast_paths(conf)
         for ob in conf.get("outbounds", []):
             if ob.get("tag") == "proxy":
                 up = {
@@ -1002,12 +1247,14 @@ class FastRelay:
                     "user":     ob.get("username", ""),
                     "password": ob.get("password", ""),
                     # Метку пути к прокси уважаем так же, как sing-box: без неё
-                    # трафик ушёл бы другим маршрутом, чем UDP того же прокси.
+                    # трафик ушёл бы другим маршрутом, чем у самого sing-box.
                     "mark":     routing_mark_of(ob),
+                    "fast":     fast,
+                    "udp":      fast_udp,
                 }
                 self._upstream = (mtime, up)
                 return up
-        raise RuntimeError("в config.json нет outbound proxy")
+        raise NoUpstream("в config.json нет outbound proxy")
 
     async def resolve(self, host: str) -> str:
         # Домен самого прокси sing-box резолвит напрямую (direct-dns), мимо
@@ -1039,23 +1286,257 @@ class FastRelay:
         return await asyncio.open_connection(sock=s, limit=FAST_CHUNK)
 
     @staticmethod
-    async def read_replies(reader, has_auth: bool) -> None:
-        g = await reader.readexactly(2)
+    async def read_replies(reader, has_auth: bool):
+        """Ответы прокси на приветствие, логин и команду; возвращает BND (host, port)."""
+        try:
+            g = await reader.readexactly(2)
+        except asyncio.IncompleteReadError as e:
+            if e.partial:
+                raise
+            raise UpstreamSilent("прокси закрыл соединение, не ответив") from e
+        except ConnectionError as e:
+            raise UpstreamSilent(f"прокси сбросил соединение, не ответив ({type(e).__name__})") from e
         if g[0] != 5 or g[1] != (2 if has_auth else 0):
             raise RuntimeError(f"прокси выбрал метод авторизации {g[1]}")
         if has_auth and (await reader.readexactly(2))[1] != 0:
             raise RuntimeError("прокси отверг логин/пароль")
         head = await reader.readexactly(4)
         if head[1] != 0:
-            raise RuntimeError(f"прокси отклонил CONNECT, код {head[1]}")
+            raise RuntimeError(f"прокси отклонил команду, код {head[1]}")
         if head[3] == 1:
-            await reader.readexactly(6)
+            host = socket.inet_ntoa(await reader.readexactly(4))
         elif head[3] == 4:
-            await reader.readexactly(18)
+            host = socket.inet_ntop(socket.AF_INET6, await reader.readexactly(16))
         elif head[3] == 3:
-            await reader.readexactly((await reader.readexactly(1))[0] + 2)
+            host = (await reader.readexactly((await reader.readexactly(1))[0])).decode()
         else:
             raise RuntimeError(f"неизвестный ATYP {head[3]} в ответе прокси")
+        return host, struct.unpack("!H", await reader.readexactly(2))[0]
+
+    async def upstream_handshake(self, up: dict, command: bytes, early: bytes, conn, pooled):
+        """Всё рукопожатие одним пакетом. Соединение из запаса могло умереть ровно
+        к моменту использования — тогда повтор на свежем: данные клиента ещё у
+        нас, до цели они не дошли. При любой ошибке соединение закрыто."""
+        has_auth = bool(up["user"] and up["password"])
+        payload = socks5_hello(up["user"], up["password"]) + command + early
+        for attempt in (0, 1):
+            reader, writer = conn
+            try:
+                writer.write(payload)
+                await writer.drain()
+                bnd = await asyncio.wait_for(self.read_replies(reader, has_auth),
+                                             FAST_REPLY_TIMEOUT)
+                return reader, writer, bnd
+            except (UpstreamSilent, ConnectionError):
+                writer.close()
+                if attempt or pooled is None:
+                    raise
+                self.stats["pool_retries"] += 1
+                self.pool_died(time.monotonic() - pooled.born)
+            except BaseException:
+                writer.close()
+                raise
+            conn = await self.open_upstream(up)
+
+    # ── запасы ──
+    def take_tcp(self, demand: bool = True):
+        now = time.monotonic()
+        if demand:
+            self.last_tcp_use = now
+            self.tcp_takes.append(now)
+        while self.tcp_pool:
+            w = self.tcp_pool.pop(0)
+            if w.usable(self.tcp_max_age):
+                return w
+            w.close()
+        return None
+
+    def take_assoc(self):
+        now = time.monotonic()
+        self.last_udp_use = now
+        self.udp_takes.append(now)
+        while self.udp_pool:
+            a = self.udp_pool.pop(0)
+            if a.usable(self.UDP_POOL_AGE):
+                return a
+            a.close()
+        return None
+
+    def pool_died(self, age: float) -> None:
+        """Соединение из запаса оказалось мёртвым. Похоже на тайм-аут простоя —
+        сокращаем срок запаса; умерло совсем молодым — это разовый сбой, и только
+        серия таких сбоев выключает запас до повторного замера."""
+        now = time.monotonic()
+        self.pool_deaths.append(now)
+        new = 0.7 * age
+        if new >= self.POOL_MIN_AGE:
+            if new < self.tcp_max_age:
+                self.tcp_max_age = new
+                log.info(f"fast-relay: соединение из запаса умерло в {age:.1f} с — "
+                         f"срок жизни запаса теперь {new:.1f} с")
+        elif sum(1 for t in self.pool_deaths if now - t < 60) >= 3 and self.tcp_max_age:
+            self.tcp_max_age = 0.0
+            self.reprobe_at = now + self.POOL_REPROBE
+            log.info(f"fast-relay: соединения из запаса умирают сразу — запас TCP выключен, "
+                     f"перемерю через {self.POOL_REPROBE} с")
+
+    def _target(self, takes, last_use, idle_off, now, base, cap) -> int:
+        if not last_use or now - last_use > idle_off:
+            return 0
+        burst = sum(1 for t in takes if now - t < 10)
+        return min(cap, max(base, burst // 2))
+
+    async def open_assoc(self, up: dict, demand: bool) -> "_Assoc":
+        """ASSOCIATE одним пакетом, по возможности на соединении из запаса TCP."""
+        pooled = self.take_tcp(demand)
+        conn = (pooled.reader, pooled.writer) if pooled else await self.open_upstream(up)
+        reader, writer, (host, port) = await self.upstream_handshake(
+            up, SOCKS5_ASSOCIATE_ANY, b"", conn, pooled)
+        assoc = _Assoc(reader, writer, None)
+        try:
+            if host in ("0.0.0.0", "::"):
+                host = await self.resolve(up["server"])
+            assoc.bnd = (host, port)
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                apply_proxy_mark(s, up["mark"])
+                grow_udp_buffers(s)
+                s.bind(("0.0.0.0", 0))
+            except BaseException:
+                s.close()
+                raise
+
+            def from_proxy(data, addr, a=assoc):
+                if addr[:2] == a.bnd and a.on_reply is not None:
+                    a.on_reply(data)
+
+            assoc.udp = _FastUdp(asyncio.get_running_loop(), s, from_proxy)
+            return assoc
+        except BaseException:
+            assoc.close()
+            raise
+
+    async def warm_tcp(self, up: dict, key) -> None:
+        self.tcp_opening += 1
+        try:
+            reader, writer = await self.open_upstream(up)
+        except Exception as e:
+            self.log_failure("pool", e)
+            return
+        finally:
+            self.tcp_opening -= 1
+        if key != self.pool_key or not self.tcp_max_age:
+            writer.close()
+            return
+        self.tcp_pool.append(_Warm(reader, writer))
+
+    async def warm_assoc(self, up: dict, key) -> None:
+        self.udp_opening += 1
+        try:
+            assoc = await self.open_assoc(up, demand=False)
+        except Exception as e:
+            self.log_failure("udp-pool", e)
+            return
+        finally:
+            self.udp_opening -= 1
+        if key != self.pool_key:
+            assoc.close()
+            return
+        self.udp_pool.append(assoc)
+
+    async def probe_idle(self, up: dict, key) -> None:
+        """Сколько прокси держит TCP-соединение, в которое ничего не прислали.
+        Проверка — настоящее рукопожатие после простоя, а не просто «не пришёл
+        FIN»: часть серверов закрывает молча."""
+        has_auth = bool(up["user"] and up["password"])
+        command = b"\x05\x01\x00\x01" + socket.inet_aton(PROXY_DNS_IP) + struct.pack("!H", 443)
+
+        async def survives(sec) -> bool:
+            try:
+                reader, writer = await self.open_upstream(up)
+            except Exception:
+                return False
+            try:
+                await asyncio.sleep(sec)
+                if reader.at_eof():
+                    return False
+                writer.write(socks5_hello(up["user"], up["password"]) + command)
+                await writer.drain()
+                await asyncio.wait_for(self.read_replies(reader, has_auth), FAST_REPLY_TIMEOUT)
+                return True
+            except Exception:
+                return False
+            finally:
+                writer.close()
+
+        results = await asyncio.gather(*(survives(s) for s in self.IDLE_CHECKPOINTS))
+        lifetime = 0
+        for sec, ok in zip(self.IDLE_CHECKPOINTS, results):
+            if not ok:
+                break
+            lifetime = sec
+        if key != self.pool_key:
+            return
+        age = min(0.7 * lifetime, self.POOL_MAX_AGE)
+        self.tcp_max_age = age if age >= self.POOL_MIN_AGE else 0.0
+        log.info(f"fast-relay: пустое соединение живёт у прокси ≥{lifetime} с → "
+                 + (f"запас TCP со сроком {age:.1f} с" if self.tcp_max_age else "запас TCP выключен"))
+
+    def reset_pools(self, key) -> None:
+        for item in self.tcp_pool + self.udp_pool:
+            item.close()
+        self.tcp_pool, self.udp_pool = [], []
+        self.pool_key = key
+        self.tcp_max_age = 0.0
+        self.reprobe_at = 0.0
+
+    @staticmethod
+    def _prune(items, max_age: float) -> list:
+        keep = []
+        for item in items:
+            if item.usable(max_age):
+                keep.append(item)
+            else:
+                item.close()
+        return keep
+
+    def maintain_once(self) -> None:
+        try:
+            up = self.upstream()
+        except NoUpstream:
+            if self.pool_key is not None:
+                self.reset_pools(None)
+            return
+        key = (up["server"], up["port"], up["mark"], up["user"], up["password"],
+               up["fast"], up["udp"])
+        now = time.monotonic()
+        if key != self.pool_key:
+            self.reset_pools(key)
+            if up["fast"]:
+                asyncio.ensure_future(self.probe_idle(up, key))
+        elif up["fast"] and self.reprobe_at and now >= self.reprobe_at:
+            self.reprobe_at = 0.0
+            asyncio.ensure_future(self.probe_idle(up, key))
+
+        self.tcp_pool = self._prune(self.tcp_pool, self.tcp_max_age)
+        want = self._target(self.tcp_takes, self.last_tcp_use, self.POOL_IDLE_OFF, now, 2, 8) \
+            if up["fast"] and self.tcp_max_age else 0
+        for _ in range(want - len(self.tcp_pool) - self.tcp_opening):
+            asyncio.ensure_future(self.warm_tcp(up, key))
+
+        self.udp_pool = self._prune(self.udp_pool, self.UDP_POOL_AGE)
+        want = self._target(self.udp_takes, self.last_udp_use, self.UDP_IDLE_OFF, now, 1, 4) \
+            if up["udp"] else 0
+        for _ in range(want - len(self.udp_pool) - self.udp_opening):
+            asyncio.ensure_future(self.warm_assoc(up, key))
+
+    async def maintain(self) -> None:
+        while True:
+            try:
+                self.maintain_once()
+            except Exception as e:
+                self.log_failure("pool", e)
+            await asyncio.sleep(self.MAINTAIN_EVERY)
 
     # ── соединение ──
     async def handle(self, creader, cwriter):
@@ -1063,6 +1544,7 @@ class FastRelay:
         self.stats["total"] += 1
         stage = "local"
         uwriter = None
+        connect = None
         tasks = []
         try:
             up = self.upstream()
@@ -1095,16 +1577,27 @@ class FastRelay:
             else:
                 return
             addr += await creader.readexactly(2)
+            if head[0] == 5 and head[1] == 3 and up["udp"]:
+                stage = "udp"
+                await self.handle_udp(cwriter, creader, up)
+                return
             if head[0] != 5 or head[1] != 1:
                 cwriter.write(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
                 return
 
-            # 2. Подтверждаем CONNECT сразу, параллельно открываем TCP до прокси
-            #    и ждём первые данные клиента: sing-box отдаёт их сразу за ответом.
+            # 2. Подтверждаем CONNECT сразу; параллельно берём соединение из
+            #    запаса (или открываем новое) и ждём первые данные клиента:
+            #    sing-box отдаёт их сразу за ответом.
             cwriter.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
             await cwriter.drain()
             stage = "connect"
-            connect = asyncio.ensure_future(self.open_upstream(up))
+            pooled = self.take_tcp()
+            if pooled is not None:
+                self.stats["pool_hits"] += 1
+                connect = asyncio.get_running_loop().create_future()
+                connect.set_result((pooled.reader, pooled.writer))
+            else:
+                connect = asyncio.ensure_future(self.open_upstream(up))
             first = asyncio.ensure_future(creader.read(FAST_CHUNK))
             tasks += [connect, first]
             await asyncio.wait({connect, first}, return_when=asyncio.FIRST_COMPLETED)
@@ -1124,19 +1617,20 @@ class FastRelay:
                 if not early:
                     return          # клиент закрылся, ничего не прислав
                 self.stats["early_data"] += 1
-            ureader, uwriter = await connect
+            conn = await connect
 
             # 3. Всё рукопожатие с прокси — одним пакетом.
             stage = "handshake"
-            uwriter.write(socks5_hello(up["user"], up["password"])
-                          + b"\x05\x01\x00" + head[3:4] + addr + early)
-            await uwriter.drain()
-            await asyncio.wait_for(self.read_replies(ureader, has_auth), FAST_REPLY_TIMEOUT)
+            ureader, uwriter, _ = await self.upstream_handshake(
+                up, b"\x05\x01\x00" + head[3:4] + addr, early, conn, pooled)
 
             stage = "relay"
             await self.pipe(creader, cwriter, ureader, uwriter)
         except Exception as e:
-            if stage != "relay":
+            if stage == "udp":
+                self.stats["udp_failed"] += 1
+                self.log_failure(stage, e)
+            elif stage != "relay":
                 self.stats["failed"] += 1
                 self.log_failure(stage, e)
             self.abort(cwriter)
@@ -1144,6 +1638,9 @@ class FastRelay:
             for t in tasks:
                 if not t.done():
                     t.cancel()
+            if (uwriter is None and connect is not None and connect.done()
+                    and not connect.cancelled() and connect.exception() is None):
+                connect.result()[1].close()      # соединение не пригодилось
             for w in (cwriter, uwriter):
                 if w is not None:
                     try:
@@ -1151,6 +1648,81 @@ class FastRelay:
                     except Exception:
                         pass
             self.stats["active"] -= 1
+
+    async def handle_udp(self, cwriter, creader, up: dict) -> None:
+        """UDP ASSOCIATE от sing-box. Отвечаем сразу адресом своего локального
+        UDP-сокета; датаграммы до готовности ассоциации у прокси копим."""
+        loop = asyncio.get_running_loop()
+        self.stats["udp_sessions"] += 1
+        state = {"peer": None, "assoc": None}
+        pending = []
+
+        def from_singbox(data, addr):
+            # Сокет слушает только loopback, так что пишут в него только локальные
+            # процессы. Адрес источника при этом не обязательно 127.0.0.1:
+            # MASQUERADE из apply_iptables (без -o) переписывает и loopback —
+            # на коробке датаграммы приходят «от 10.0.0.1». Поэтому сессия просто
+            # привязывается к первому отправителю.
+            if state["peer"] is None:
+                state["peer"] = addr
+            elif addr != state["peer"]:
+                return
+            assoc = state["assoc"]
+            if assoc is not None:
+                assoc.udp.sendto(data, assoc.bnd)
+            elif len(pending) < FAST_UDP_BUFFER:
+                pending.append(data)
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            grow_udp_buffers(s)
+            s.bind(("127.0.0.1", 0))
+        except BaseException:
+            s.close()
+            raise
+        local = _FastUdp(loop, s, from_singbox)
+        assoc = None
+        try:
+            port = s.getsockname()[1]
+            cwriter.write(b"\x05\x00\x00\x01" + socket.inet_aton("127.0.0.1") + struct.pack("!H", port))
+            await cwriter.drain()
+            assoc = self.take_assoc()
+            if assoc is not None:
+                self.stats["udp_pool_hits"] += 1
+            else:
+                assoc = await self.open_assoc(up, demand=True)
+
+            def to_singbox(data):
+                if state["peer"] is not None:
+                    local.sendto(data, state["peer"])
+
+            assoc.on_reply = to_singbox
+            state["assoc"] = assoc
+            for data in pending:
+                assoc.udp.sendto(data, assoc.bnd)
+            pending.clear()
+            # Сессия живёт, пока открыты обе управляющие TCP-связи.
+            await self.wait_closed(creader, assoc.reader)
+        finally:
+            local.close()
+            if assoc is not None:
+                assoc.close()
+
+    @staticmethod
+    async def wait_closed(*readers) -> None:
+        async def until_eof(reader):
+            try:
+                while await reader.read(4096):
+                    pass
+            except (ConnectionError, OSError):
+                pass
+
+        tasks = [asyncio.ensure_future(until_eof(r)) for r in readers]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in tasks:
+                t.cancel()
 
     async def pipe(self, creader, cwriter, ureader, uwriter) -> None:
         moved = {"up": 0, "down": 0}
@@ -1215,7 +1787,7 @@ class FastRelay:
         if now - self._last_log.get(key, 0) >= 10:
             self._last_log[key] = now
             log.warning(f"fast-relay: сбой на шаге {stage}: {type(e).__name__}: {e} "
-                        f"(всего сбоев {self.stats['failed']})")
+                        f"(сбоев TCP {self.stats['failed']}, UDP {self.stats['udp_failed']})")
 
     @staticmethod
     def raise_fd_limit() -> None:
@@ -1240,11 +1812,12 @@ class FastRelay:
     def serve_forever(self) -> None:
         self.raise_fd_limit()
         while True:
-            loop = asyncio.new_event_loop()
+            loop = asyncio.SelectorEventLoop()
             try:
                 asyncio.set_event_loop(loop)
                 loop.run_until_complete(asyncio.start_server(
                     self.handle, FAST_RELAY_HOST, FAST_RELAY_PORT, backlog=1024))
+                loop.create_task(self.maintain())
                 self.listening = True
                 log.info(f"fast-relay: слушаю {FAST_RELAY_HOST}:{FAST_RELAY_PORT}")
                 loop.run_forever()
@@ -1342,7 +1915,7 @@ async def set_proxy(req: ProxyRequest):
             user=proxy["user"], password=proxy["password"],
             udp_supported=caps["udp_supported"],
             dns_mode=caps["dns_mode"], dns_server=caps["dns_server"],
-            fast_relay=caps["pipelining"],
+            fast_relay=caps["pipelining"], fast_udp=caps["udp_pipelining"],
         )
         log.info("Конфиг записан, перезапуск sing-box в фоне…")
         def restart_in_bg():
@@ -1360,6 +1933,7 @@ async def set_proxy(req: ProxyRequest):
             "dns_mode": caps["dns_mode"],
             "dns_server": caps["dns_server"],
             "fast_relay": caps["pipelining"],
+            "fast_udp": caps["udp_pipelining"],
         }
     except Exception as e:
         log.error(f"Ошибка применения прокси: {e}")
@@ -1390,6 +1964,7 @@ async def set_quic(block_quic: bool):
             block_quic=block_quic,
             dns_mode=proxy_data["dns_mode"], dns_server=proxy_data["dns_server"],
             fast_relay=proxy_data["fast_relay"],
+            fast_udp=proxy_data["fast_udp"] and udp_ok,
         )
         log.info("Конфиг записан, перезапуск sing-box в фоне…")
         def restart_in_bg():
@@ -1732,7 +2307,7 @@ async def status():
     mode = "bypass"
     quic_effective = False
     dns_mode = None
-    fast_enabled = False
+    fast_enabled = fast_udp = False
     try:
         conf = json.load(open(SINGBOX_CONF))
         for srv in conf.get("dns", {}).get("servers", []):
@@ -1743,8 +2318,7 @@ async def status():
             if ob.get("tag") == "proxy":
                 proxy = f"{ob['server']}:{ob['server_port']}"
                 mode = "proxy"
-            elif ob.get("tag") == "proxy-fast":
-                fast_enabled = True
+        fast_enabled, fast_udp = config_fast_paths(conf)
         # Есть ли правило блокировки QUIC в маршрутах — это ФАКТ, а не выбор
         # пользователя: правило могло появиться и автоматически, из-за прокси
         # без UDP ASSOCIATE.
@@ -1770,8 +2344,12 @@ async def status():
         "quic_effective": quic_effective,
         "dns_mode": dns_mode,
         # enabled — ускоритель в конфиге; listening — поток в этом процессе жив.
-        "fast_relay": dict(FAST_RELAY.stats, enabled=fast_enabled,
-                           listening=FAST_RELAY.listening),
+        "fast_relay": dict(FAST_RELAY.stats, enabled=fast_enabled, udp=fast_udp,
+                           listening=FAST_RELAY.listening,
+                           tcp_pool_max_age=round(FAST_RELAY.tcp_max_age, 1),
+                           tcp_pool=len(FAST_RELAY.tcp_pool),
+                           udp_pool=len(FAST_RELAY.udp_pool)),
+        "sing_box_version": ".".join(map(str, singbox_version())) or None,
     }
 
 
