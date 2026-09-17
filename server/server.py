@@ -272,6 +272,13 @@ def make_singbox_conf(ip: str, port: int, user: str, password: str,
         "version": "5",
         "username": user,
         "password": password,
+        # TCP Fast Open до прокси: SOCKS5-приветствие уходит прямо в SYN, минус
+        # 1 RTT на каждое новое соединение (и на каждый DNS-запрос через proxy-dns).
+        # Работает, только если TFO включён на стороне прокси; если нет — ядро
+        # молча делает обычный хендшейк, данные в SYN не шлются без cookie.
+        # Путь трафика и DNS не меняется: в SYN только методы авторизации,
+        # логин/пароль идут следующим шагом, как и раньше.
+        "tcp_fast_open": True,
         # ПРИМЕЧАНИЕ: "domain_strategy" тут намеренно НЕ ставим — проверено
         # эмпирически на живой коробке, что для SOCKS5 (умеет ATYP=domain
         # нативно) это поле не действует и никак не влияет на резолв домена.
@@ -696,8 +703,8 @@ def probe_dns_tcp53(ip: str, port: int, user: str, password: str,
 
 def probe_dns_doh(ip: str, port: int, user: str, password: str,
                   server: str = PROXY_DNS_IP, timeout: int = PROBE_TIMEOUT) -> bool:
-    """Проверяет DoH (RFC 8484) по :443 через прокси — запасной транспорт для
-    резолвера, когда апстрим режет :53. Проверка сертификата НЕ ослаблена:
+    """Проверяет DoH (RFC 8484) по :443 через прокси — основной транспорт
+    резолвера (быстрее :53, см. probe_proxy). Проверка сертификата НЕ ослаблена:
     server всегда IP-литерал, а он есть в IP SAN сертификатов 8.8.8.8 и 1.1.1.1."""
     s = None
     try:
@@ -754,13 +761,17 @@ def probe_proxy(ip: str, port: int, user: str, password: str) -> dict:
         # wait=False: не держим ответ ради «опоздавших» проб, их сокеты закроются сами.
         ex.shutdown(wait=False)
 
-    if tcp53_ok:
-        # Приоритет у plain :53 намеренно: это ровно тот конфиг, который уже
-        # работает на всём текущем парке прокси. DoH включаем только там, где
-        # без него не поедет вообще — так фикс не меняет поведение остальных.
-        dns_mode, dns_server = "tcp53", PROXY_DNS_IP
-    elif doh_ok:
+    if doh_ok:
+        # Приоритет у DoH — ради задержки. Транспорт "tcp" в sing-box открывает
+        # НОВОЕ соединение на каждый запрос (dns/transport/tcp.go, v1.13.13), то
+        # есть полный SOCKS5-хендшейк через прокси: ~5 RTT на каждый некэшированный
+        # домен, а правило "resolve" гоняет резолв перед КАЖДЫМ новым соединением.
+        # DoH держит HTTP/2-соединение открытым — на тёплом канале ~1 RTT.
+        # Утечек это не добавляет: оба транспорта идут через detour=proxy на тот
+        # же 8.8.8.8, а DoH ещё и прячет домены от самого прокси-провайдера.
         dns_mode, dns_server = "doh", PROXY_DNS_IP
+    elif tcp53_ok:
+        dns_mode, dns_server = "tcp53", PROXY_DNS_IP
     elif probe_dns_doh(ip, port, user, password, PROXY_DNS_ALT, PROBE_TIMEOUT):
         dns_mode, dns_server = "doh", PROXY_DNS_ALT
     else:
