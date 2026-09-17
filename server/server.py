@@ -23,7 +23,7 @@ import concurrent.futures as cf
 import logging
 import ipaddress
 import urllib.request
-from typing import Tuple
+from typing import Optional, Tuple
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -126,13 +126,17 @@ def routing_mark_of(outbound: dict) -> int:
 
 
 def proxy_routing_mark() -> int:
-    """routing_mark outbound'а "proxy" из текущего config.json (0, если его нет).
+    """routing_mark пути до прокси: метка AmneziaWG, если туннель включён, иначе
+    routing_mark outbound'а "proxy" из текущего config.json (0, если его нет).
 
     Пробы и тесты обязаны ходить к прокси тем же маршрутом, что sing-box и
     FastRelay. На коробке с маршрутизацией по метке (локальный патч ставит 100 →
     VPN-туннель) прямой путь ведёт себя совсем иначе: проверено — без метки
     /proxy_health вставал на ~17 КБ и показывал «мёртвый прокси», хотя трафик
     устройств через тот же прокси шёл нормально."""
+    mark = awg_routing_mark()
+    if mark:
+        return mark
     try:
         with open(SINGBOX_CONF) as f:
             conf = json.load(f)
@@ -296,7 +300,7 @@ def make_singbox_conf(ip: str, port: int, user: str, password: str,
                       udp_supported: bool = True, block_quic: bool = False,
                       dns_mode: str = "tcp53", dns_server: str = PROXY_DNS_IP,
                       fast_relay: bool = False, fast_udp: bool = False,
-                      dns_optimistic: bool = False) -> dict:
+                      dns_optimistic: bool = False, routing_mark: int = 0) -> dict:
     # fast_udp — UDP тоже через ретранслятор. Только поверх fast_relay и только
     # для прокси, у которого UDP ASSOCIATE вообще работает.
     fast_udp = fast_udp and fast_relay and udp_supported
@@ -417,6 +421,10 @@ def make_singbox_conf(ip: str, port: int, user: str, password: str,
         # "DNS query loopback in transport[proxy-dns]" и наружу не идёт НИЧЕГО.
         # Поле проверено `sing-box check` на 1.13 — конфиг принимается.
         socks_out["domain_resolver"] = "direct-dns"
+    if routing_mark:
+        # Путь до прокси — через AmneziaWG (см. awg_*). Ретранслятор и пробы
+        # берут метку отсюда же.
+        socks_out["routing_mark"] = routing_mark
 
     # "proxy" остаётся первым и с настоящим адресом апстрима: его читают
     # read_active_proxy, /status, update.py и локальные патчи (routing_mark).
@@ -575,11 +583,12 @@ def write_singbox_conf(ip: str, port: int, user: str, password: str,
         fast_udp = bool(fast_relay and udp_supported and check_udp_associate(
             ip, port, user, password, PROBE_TIMEOUT, pipelined=True))
     dns_optimistic = singbox_has_dns_optimistic()
+    routing_mark = awg_routing_mark()
     os.makedirs(os.path.dirname(SINGBOX_CONF), exist_ok=True)
     conf = make_singbox_conf(ip, port, user, password, udp_supported=udp_supported,
                              block_quic=block_quic, dns_mode=dns_mode, dns_server=dns_server,
                              fast_relay=fast_relay, fast_udp=fast_udp,
-                             dns_optimistic=dns_optimistic)
+                             dns_optimistic=dns_optimistic, routing_mark=routing_mark)
     with open(SINGBOX_CONF, "w") as f:
         json.dump(conf, f, indent=2)
     # Запоминаем именно ВЫБОР пользователя, а не итоговую блокировку.
@@ -588,7 +597,7 @@ def write_singbox_conf(ip: str, port: int, user: str, password: str,
              f"block_quic={block_quic}  effective_block_quic={block_quic or not udp_supported}  "
              f"dns={dns_mode}:{dns_server}  fast_relay={fast_relay}  "
              f"fast_udp={bool(fast_udp and fast_relay and udp_supported)}  "
-             f"dns_optimistic={dns_optimistic}")
+             f"dns_optimistic={dns_optimistic}  awg_mark={routing_mark}")
 
 
 def ensure_singbox_conf_compat() -> None:
@@ -1897,6 +1906,435 @@ def proxy_health_test(proxy: dict) -> dict:
             pass
 
 
+# ── AmneziaWG: туннель от коробки до прокси ──────────────────────────────────
+# Провайдер коробки может душить прямой путь до прокси (на живой коробке — обрыв
+# после ~17 КБ). Тогда трафик sing-box к прокси (и ретранслятора, и проб) идёт
+# через AmneziaWG: у outbound "proxy" routing_mark AWG_MARK, правило
+# fwmark AWG_MARK → таблица AWG_TABLE → default dev awg0. Остальной трафик
+# коробки (SSH, GitHub, API) туннель не трогает: Table = off.
+#
+# Профили — конфиги из Amnezia (экспорт AmneziaWG) в AWG_PROFILES_DIR. Активный
+# копируется в AWG_DIR/awg0.conf после нормализации (awg_normalize): имя
+# интерфейса всегда awg0, поэтому маршрут не зависит от профиля.
+
+AWG_DIR          = "/etc/amnezia/amneziawg"
+AWG_PROFILES_DIR = AWG_DIR + "/profiles"
+AWG_IFACE        = "awg0"
+AWG_UNIT         = f"awg-quick@{AWG_IFACE}"
+AWG_MARK         = 100
+AWG_TABLE        = 200
+AWG_RULE_PREF    = 200
+AWG_MAX_CONF     = 16384
+AWG_CONNECT_TIMEOUT = 8        # проверка «прокси доступен через туннель» после включения
+AWG_NAME_RE      = re.compile(r"^\w[\w.-]{0,31}$")
+# Ключи [Interface], которые из профиля выбрасываются. DNS — системный резолвер
+# коробки не должен уходить в туннель (при Table = off он там и недоступен), а в
+# экспортах Amnezia бывают неподставленные "$PRIMARY_DNS". Хуки — это команды,
+# которые awg-quick выполняет от root, а профиль приходит по HTTP без авторизации.
+AWG_DROP_KEYS    = {"dns", "table", "preup", "postup", "predown", "postdown", "saveconfig"}
+AWG_POSTUP  = (f"ip rule show pref {AWG_RULE_PREF} | grep -q 'lookup {AWG_TABLE}' || "
+               f"ip rule add pref {AWG_RULE_PREF} fwmark {AWG_MARK} table {AWG_TABLE}; "
+               f"ip route replace default dev %i table {AWG_TABLE}")
+AWG_PREDOWN = f"ip route del default dev %i table {AWG_TABLE} 2>/dev/null || true"
+
+_awg_lock = threading.Lock()
+
+
+def awg_installed() -> bool:
+    return bool(shutil.which("awg") and shutil.which("awg-quick"))
+
+
+def awg_service_active() -> bool:
+    return run(f"systemctl is-active {AWG_UNIT}")[1].strip() == "active"
+
+
+def awg_enabled() -> bool:
+    """Включён ли туннель — выбор пользователя из панели. Пока из панели ни разу
+    не переключали, считаем как настроено руками: сервис запущен — включён."""
+    st = read_state()
+    if "awg_enabled" in st:
+        return bool(st["awg_enabled"])
+    return awg_installed() and awg_service_active()
+
+
+def awg_routing_mark() -> int:
+    return AWG_MARK if awg_enabled() else 0
+
+
+def awg_parse(text: str) -> list:
+    """INI в стиле WireGuard → [(секция, [(ключ, значение), ...]), ...].
+    Порядок и повторы сохраняются: [Peer] может быть несколько."""
+    sections = []
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        m = re.fullmatch(r"\[\s*(\w+)\s*\]", line)
+        if m:
+            sections.append((m.group(1).lower(), []))
+            continue
+        if "=" not in line or not sections:
+            raise ValueError(f"непонятная строка: {line[:60]!r}")
+        key, val = line.split("=", 1)
+        sections[-1][1].append((key.strip(), val.strip()))
+    return sections
+
+
+def _awg_get(items: list, key: str) -> str:
+    for k, v in items:
+        if k.lower() == key:
+            return v
+    return ""
+
+
+def awg_summary(text: str) -> dict:
+    """Что показать в панели — без ключей."""
+    info = {"endpoint": "", "address": ""}
+    try:
+        for name, items in awg_parse(text):
+            if name == "interface" and not info["address"]:
+                info["address"] = _awg_get(items, "address")
+            elif name == "peer" and not info["endpoint"]:
+                info["endpoint"] = _awg_get(items, "endpoint")
+    except ValueError:
+        pass
+    return info
+
+
+def awg_normalize(text: str, profile: str) -> str:
+    out = [f"# Сгенерировано JackalRouter из профиля {profile!r} — не редактировать.",
+           f"# Правьте профиль в {AWG_PROFILES_DIR}."]
+    for name, items in awg_parse(text):
+        out.append("")
+        out.append(f"[{'Interface' if name == 'interface' else 'Peer'}]")
+        for key, val in items:
+            if name == "interface" and key.lower() in AWG_DROP_KEYS:
+                continue
+            out.append(f"{key} = {val}")
+        if name == "interface":
+            out += ["Table = off", f"PostUp = {AWG_POSTUP}", f"PreDown = {AWG_PREDOWN}"]
+    return "\n".join(out) + "\n"
+
+
+def awg_validate(text: str) -> None:
+    """Бросает ValueError с понятным текстом. Сначала структура, затем — если
+    есть модуль ядра — настоящая проверка: временный интерфейс + awg setconf
+    (без адресов и маршрутов, сразу удаляется)."""
+    if len(text.encode("utf-8")) > AWG_MAX_CONF:
+        raise ValueError("файл слишком большой для конфига AmneziaWG")
+    sections = awg_parse(text)
+    ifaces = [items for name, items in sections if name == "interface"]
+    peers = [items for name, items in sections if name == "peer"]
+    if len(ifaces) != 1:
+        raise ValueError("нужна ровно одна секция [Interface]")
+    for key in ("privatekey", "address"):
+        if not _awg_get(ifaces[0], key):
+            raise ValueError(f"в [Interface] нет {key}")
+    if not peers:
+        raise ValueError("нет секции [Peer]")
+    for peer in peers:
+        for key in ("publickey", "endpoint", "allowedips"):
+            if not _awg_get(peer, key):
+                raise ValueError(f"в [Peer] нет {key}")
+    if not awg_installed():
+        return
+    tmpdir = tempfile.mkdtemp(prefix="jrawg")
+    link = f"jrchk{os.getpid() % 10000}"
+    try:
+        path = os.path.join(tmpdir, f"{link}.conf")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(awg_normalize(text, "check"))
+        r = subprocess.run(["awg-quick", "strip", path], capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            raise ValueError(f"awg-quick не принял конфиг: {r.stderr.strip()[-200:]}")
+        stripped = os.path.join(tmpdir, "stripped.conf")
+        with open(stripped, "w", encoding="utf-8") as f:
+            f.write(r.stdout)
+        if run(f"ip link add {link} type amneziawg")[0] != 0:
+            return                      # userspace-реализация — хватит strip
+        try:
+            code, _, err = run(f"awg setconf {link} {stripped}")
+            if code != 0:
+                raise ValueError(f"awg не принял конфиг: {err[-200:]}")
+        finally:
+            run(f"ip link del {link}")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def awg_profile_path(name: str) -> str:
+    if not AWG_NAME_RE.fullmatch(name or ""):
+        raise ValueError("имя профиля: буквы, цифры, _ . - (до 32 символов)")
+    return os.path.join(AWG_PROFILES_DIR, f"{name}.conf")
+
+
+def awg_profile_names() -> list:
+    try:
+        return sorted(f[:-5] for f in os.listdir(AWG_PROFILES_DIR)
+                      if f.endswith(".conf") and AWG_NAME_RE.fullmatch(f[:-5]))
+    except FileNotFoundError:
+        return []
+
+
+def _write_private(path: str, content: str) -> None:
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+        f.write(content)
+    os.replace(path + ".tmp", path)
+
+
+def awg_adopt_existing() -> None:
+    """awg0.conf, настроенный руками до появления профилей, становится профилем
+    "default" — иначе панель показала бы работающий туннель без профилей."""
+    live = os.path.join(AWG_DIR, f"{AWG_IFACE}.conf")
+    if awg_profile_names() or not os.path.exists(live):
+        return
+    try:
+        text = open(live, encoding="utf-8").read()
+        awg_parse(text)
+    except (OSError, ValueError) as e:
+        log.warning(f"AWG: {live} не удалось взять профилем: {e}")
+        return
+    _write_private(awg_profile_path("default"), text)
+    if not read_state().get("awg_profile"):
+        write_state(awg_profile="default")
+    log.info(f"AWG: существующий {live} сохранён профилем 'default'")
+
+
+def awg_runtime() -> dict:
+    """Рукопожатие и трафик живого интерфейса — без ключей пиров."""
+    info = {"handshake_age": None, "rx": 0, "tx": 0, "endpoint": ""}
+    code, out, _ = run(f"awg show {AWG_IFACE} dump")
+    if code != 0:
+        return info
+    now = time.time()
+    for line in out.splitlines()[1:]:          # первая строка — сам интерфейс
+        cols = line.split("\t")
+        if len(cols) < 7:
+            continue
+        info["endpoint"] = info["endpoint"] or (cols[2] if cols[2] != "(none)" else "")
+        hs = int(cols[4] or 0)
+        if hs:
+            age = int(now - hs)
+            info["handshake_age"] = age if info["handshake_age"] is None else min(age, info["handshake_age"])
+        info["rx"] += int(cols[5] or 0)
+        info["tx"] += int(cols[6] or 0)
+    return info
+
+
+def awg_status() -> dict:
+    installed = awg_installed()
+    if installed:
+        awg_adopt_existing()
+    active = read_state().get("awg_profile", "")
+    profiles = []
+    for name in awg_profile_names():
+        try:
+            text = open(awg_profile_path(name), encoding="utf-8").read()
+        except OSError:
+            continue
+        profiles.append(dict(awg_summary(text), name=name, active=name == active))
+    service = run(f"systemctl is-active {AWG_UNIT}")[1].strip() if installed else "missing"
+    rule_ok = f"lookup {AWG_TABLE}" in run(f"ip rule show pref {AWG_RULE_PREF}")[1]
+    route_ok = f"dev {AWG_IFACE}" in run(f"ip route show table {AWG_TABLE}")[1]
+    mark_in_config = False
+    try:
+        mark_in_config = routing_mark_of(next(
+            ob for ob in json.load(open(SINGBOX_CONF)).get("outbounds", [])
+            if ob.get("tag") == "proxy")) == AWG_MARK
+    except Exception:
+        pass
+    return dict(awg_runtime() if service == "active" else {"handshake_age": None, "rx": 0, "tx": 0, "endpoint": ""},
+                installed=installed, enabled=awg_enabled(), service=service, profile=active,
+                profiles=profiles, route_ok=rule_ok and route_ok, mark_in_config=mark_in_config)
+
+
+def awg_reroute_singbox() -> dict:
+    """Путь до прокси поменялся — возможности прокси по новому пути перепроверяем,
+    как при /set_proxy, и перезапускаем sing-box. В bypass-режиме прокси нет."""
+    try:
+        p = read_active_proxy()
+    except Exception:
+        return {"regenerated": False}
+    caps = probe_proxy(p["ip"], p["port"], p["user"], p["password"])
+    write_singbox_conf(p["ip"], p["port"], p["user"], p["password"],
+                       udp_supported=caps["udp_supported"], block_quic=read_quic_pref(),
+                       dns_mode=caps["dns_mode"], dns_server=caps["dns_server"],
+                       fast_relay=caps["pipelining"], fast_udp=caps["udp_pipelining"])
+    code, _, err = run("systemctl restart sing-box")
+    if code != 0:
+        raise RuntimeError(f"sing-box не перезапустился: {err[-200:]}")
+    return {"regenerated": True, "caps": caps}
+
+
+def _awg_proxy_reachable() -> Tuple[bool, str]:
+    """Через поднятый туннель до прокси достучаться можно? Заодно это первый
+    трафик в туннель — он и запускает рукопожатие."""
+    try:
+        p = read_active_proxy()
+    except Exception:
+        return True, ""                  # прокси не задан — проверять нечего
+    try:
+        connect_to_proxy(p["ip"], p["port"], AWG_CONNECT_TIMEOUT).close()
+        return True, ""
+    except OSError as e:
+        return False, f"{p['ip']}:{p['port']}: {e}"
+
+
+def awg_start(profile: str) -> None:
+    text = open(awg_profile_path(profile), encoding="utf-8").read()
+    _write_private(os.path.join(AWG_DIR, f"{AWG_IFACE}.conf"), awg_normalize(text, profile))
+    run(f"systemctl enable {AWG_UNIT} -q")
+    code, _, err = run(f"systemctl restart {AWG_UNIT}")
+    if code != 0:
+        tail = run(f"journalctl -u {AWG_UNIT} -n 5 --no-pager -o cat")[1]
+        raise RuntimeError(f"awg-quick не поднял туннель: {(tail or err)[-300:]}")
+    # PostUp делает то же самое; повтор на случай, если awg0 уже был поднят.
+    run(f"ip rule show pref {AWG_RULE_PREF} | grep -q 'lookup {AWG_TABLE}' || "
+        f"ip rule add pref {AWG_RULE_PREF} fwmark {AWG_MARK} table {AWG_TABLE}")
+    run(f"ip route replace default dev {AWG_IFACE} table {AWG_TABLE}")
+
+
+def awg_stop() -> None:
+    run(f"systemctl disable --now {AWG_UNIT} -q")
+
+
+def awg_enable(profile: str = "") -> dict:
+    if not awg_installed():
+        raise RuntimeError("AmneziaWG не установлен на сервере (нет awg / awg-quick)")
+    with _awg_lock:
+        awg_adopt_existing()
+        profile = profile or read_state().get("awg_profile", "")
+        if not profile or not os.path.exists(awg_profile_path(profile)):
+            raise ValueError("не выбран профиль AmneziaWG — добавьте его")
+        was, prev = awg_enabled(), read_state().get("awg_profile", "")
+        awg_start(profile)
+        # Метку ставим только сейчас: пробы и проверка ниже должны идти в туннель.
+        write_state(awg_enabled=True, awg_profile=profile)
+        ok, why = _awg_proxy_reachable()
+        if not ok:
+            # Сервер AmneziaWG недоступен или профиль не тот — возвращаем как было,
+            # иначе весь трафик к прокси ушёл бы в неработающий туннель.
+            write_state(awg_enabled=was, awg_profile=prev)
+            if was and prev and prev != profile and os.path.exists(awg_profile_path(prev)):
+                awg_start(prev)
+            elif not was:
+                awg_stop()
+            raise RuntimeError(f"через туннель с профилем {profile!r} прокси недоступен "
+                               f"({why}) — оставлено как было")
+        result = awg_reroute_singbox()
+    log.info(f"AWG: включён, профиль {profile!r}")
+    return dict(result, runtime=awg_runtime())
+
+
+def awg_disable() -> dict:
+    with _awg_lock:
+        write_state(awg_enabled=False)
+        # Сначала sing-box без метки, потом гасим туннель — без окна, когда
+        # трафик прокси помечен, а туннеля уже нет. Гасим в любом случае:
+        # помеченный трафик без awg0 просто пойдёт по основной таблице.
+        try:
+            result = awg_reroute_singbox()
+        finally:
+            awg_stop()
+    log.info("AWG: выключен")
+    return result
+
+
+def awg_add_profile(name: str, text: str) -> dict:
+    path = awg_profile_path(name)
+    text = text.replace("\r\n", "\n").lstrip("﻿")
+    awg_validate(text)
+    with _awg_lock:
+        if os.path.exists(path):
+            raise ValueError(f"профиль {name!r} уже есть — удалите его или выберите другое имя")
+        _write_private(path, text)
+        if not read_state().get("awg_profile"):
+            write_state(awg_profile=name)
+    log.info(f"AWG: добавлен профиль {name!r}")
+    return awg_summary(text)
+
+
+def awg_delete_profile(name: str) -> None:
+    path = awg_profile_path(name)
+    with _awg_lock:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"профиля {name!r} нет")
+        st = read_state()
+        if st.get("awg_profile") == name:
+            if awg_enabled():
+                raise PermissionError("профиль сейчас используется — выключите AmneziaWG "
+                                      "или сделайте активным другой профиль")
+            write_state(awg_profile="")
+        os.remove(path)
+    log.info(f"AWG: удалён профиль {name!r}")
+
+
+def awg_activate_profile(name: str) -> dict:
+    if not os.path.exists(awg_profile_path(name)):
+        raise FileNotFoundError(f"профиля {name!r} нет")
+    if not awg_enabled():
+        write_state(awg_profile=name)
+        return {"applied": False}
+    return dict(awg_enable(name), applied=True)
+
+
+class AwgProfileRequest(BaseModel):
+    name: str
+    config: str
+
+
+class AwgEnableRequest(BaseModel):
+    profile: str = ""
+
+
+def _awg_http(fn, *args):
+    try:
+        return dict(fn(*args) or {}, status="ok", awg=awg_status())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        log.error(f"AWG: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Синхронные def: внутри systemctl и пробы на секунды — FastAPI выполнит их в
+# пуле потоков, не блокируя остальные запросы.
+@app.get("/awg/status")
+def awg_status_ep():
+    return awg_status()
+
+
+@app.post("/awg/enable")
+def awg_enable_ep(req: Optional[AwgEnableRequest] = None):
+    return _awg_http(awg_enable, req.profile if req else "")
+
+
+@app.post("/awg/disable")
+def awg_disable_ep():
+    return _awg_http(awg_disable)
+
+
+@app.post("/awg/profiles")
+def awg_add_profile_ep(req: AwgProfileRequest):
+    return _awg_http(awg_add_profile, req.name.strip(), req.config)
+
+
+@app.delete("/awg/profiles/{name}")
+def awg_delete_profile_ep(name: str):
+    return _awg_http(awg_delete_profile, name)
+
+
+@app.post("/awg/profiles/{name}/activate")
+def awg_activate_profile_ep(name: str):
+    return _awg_http(awg_activate_profile, name)
+
+
 # ── Эндпоинты ─────────────────────────────────────────────────────────────────
 
 @app.post("/set_proxy")
@@ -2350,6 +2788,8 @@ async def status():
                            tcp_pool=len(FAST_RELAY.tcp_pool),
                            udp_pool=len(FAST_RELAY.udp_pool)),
         "sing_box_version": ".".join(map(str, singbox_version())) or None,
+        "awg": {"installed": awg_installed(), "enabled": awg_enabled(),
+                "service": svc(AWG_UNIT), "profile": read_state().get("awg_profile", "")},
     }
 
 

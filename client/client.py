@@ -5,7 +5,7 @@ Features: proxy apply, proxy check + geo, UDP check, EN/RU language, proxy histo
 """
 
 import tkinter as tk
-from tkinter import scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 import threading
 import re
 import socket
@@ -32,6 +32,10 @@ except ImportError:
 
 SERVER_PORT  = 8000
 TIMEOUT      = 15
+# Включение AmneziaWG — это подъём туннеля, проверка прокси через него и
+# повторные пробы прокси по новому пути (до ~20 с на сервере).
+AWG_TIMEOUT  = 60
+AWG_MAX_CONF = 64 * 1024
 CLIENT_VERSION = "1.14.0"   # держим в синхроне с VERSION в корне репозитория
 # Cloudflare — держит QUIC/HTTP3 на 443 на фиксированном IP (не нужен доп.
 # DNS-резолв в теле SOCKS5 UDP-релея). Используется только для проверки
@@ -498,6 +502,53 @@ S = {
         "hist_delete":    "✕  Удалить",
         "hist_nosel":     "Выберите прокси в таблице",
         "hist_dblclick":  "Двойной клик — загрузить прокси в поле выше",
+        "tab_awg":        "AmneziaWG",
+        "awg_title":      "AmneziaWG — туннель до прокси",
+        "awg_sub":        "Через туннель идёт только трафик сервера к прокси. SSH, обновления и прочий трафик Ubuntu туннель не трогает.",
+        "awg_sec_state":  "СОСТОЯНИЕ",
+        "awg_sec_prof":   "ПРОФИЛИ",
+        "awg_btn_on":     "Включить",
+        "awg_btn_off":    "Выключить",
+        "awg_btn_add":    "+  Добавить профиль",
+        "awg_btn_act":    "Сделать активным",
+        "awg_btn_del":    "Удалить",
+        "awg_col_name":   "Профиль",
+        "awg_col_ep":     "Сервер AmneziaWG",
+        "awg_col_addr":   "Адрес в туннеле",
+        "awg_hint":       "Профиль — файл .conf из Amnezia (экспорт AmneziaWG). Строки DNS, Table и PostUp/PostDown из файла не используются.",
+        "awg_st_unknown": "— откройте вкладку или нажмите ⟳",
+        "awg_st_loading": "запрашиваю состояние…",
+        "awg_st_missing": "AmneziaWG не установлен на сервере",
+        "awg_st_old":     "сервер не умеет управлять AmneziaWG — обновите его (кнопка Update)",
+        "awg_st_off":     "Выключен — трафик к прокси идёт напрямую",
+        "awg_st_on":      "Включён · профиль {} · рукопожатие {} · ↓ {}  ↑ {}",
+        "awg_st_nohs":    "Включён · профиль {} · рукопожатия с сервером ещё не было",
+        "awg_st_broken":  "Включён, но туннель {} — проверьте профиль",
+        "awg_st_noroute": "Включён, но маршрут через awg0 не настроен — выключите и включите снова",
+        "awg_ago_s":      "{} с назад",
+        "awg_ago_m":      "{} мин назад",
+        "awg_enabling":   "Включаю AmneziaWG: туннель и проверка прокси…",
+        "awg_disabling":  "Выключаю AmneziaWG…",
+        "awg_switching":  "Переключаю профиль AmneziaWG…",
+        "awg_saving":     "Сохраняю профиль…",
+        "awg_removing":   "Удаляю профиль…",
+        "awg_on_ok":      "✓ AmneziaWG включён, профиль {}",
+        "awg_off_ok":     "✓ AmneziaWG выключен — трафик к прокси идёт напрямую",
+        "awg_added":      "✓ Профиль {} добавлен ({})",
+        "awg_deleted":    "✓ Профиль {} удалён",
+        "awg_active_set": "✓ Активный профиль: {} (применится при включении)",
+        "awg_switched":   "✓ AmneziaWG переключён на профиль {}",
+        "awg_pick":       "Конфиг AmneziaWG",
+        "awg_name_title": "Профиль AmneziaWG",
+        "awg_name_ask":   "Имя профиля (буквы, цифры, _ . -, до 32 символов):",
+        "awg_del_ask":    "Удалить профиль «{}»?",
+        "awg_nosel":      "Выберите профиль в списке",
+        "awg_err":        "AmneziaWG: {}",
+        "awg_file_err":   "Не удалось прочитать файл: {}",
+        "awg_file_big":   "Файл слишком большой для конфига AmneziaWG",
+        "awg_ok_st":      "AmneziaWG ✓",
+        "srv_awg_on":     "   › AmneziaWG: включён, профиль {} ({})",
+        "srv_awg_off":    "   › AmneziaWG: выключен",
         "hist_loaded":    "Загружен из истории: {}",
         "hist_checking":  "Проверяю прокси из истории…",
     },
@@ -633,6 +684,53 @@ S = {
         "hist_delete":    "✕  Delete",
         "hist_nosel":     "Select a proxy in the table",
         "hist_dblclick":  "Double-click to load proxy into the field above",
+        "tab_awg":        "AmneziaWG",
+        "awg_title":      "AmneziaWG — tunnel to the proxy",
+        "awg_sub":        "Only the server's traffic to the proxy goes through the tunnel. SSH, updates and other Ubuntu traffic are not affected.",
+        "awg_sec_state":  "STATE",
+        "awg_sec_prof":   "PROFILES",
+        "awg_btn_on":     "Turn on",
+        "awg_btn_off":    "Turn off",
+        "awg_btn_add":    "+  Add profile",
+        "awg_btn_act":    "Make active",
+        "awg_btn_del":    "Delete",
+        "awg_col_name":   "Profile",
+        "awg_col_ep":     "AmneziaWG server",
+        "awg_col_addr":   "Tunnel address",
+        "awg_hint":       "A profile is a .conf exported from Amnezia (AmneziaWG). DNS, Table and PostUp/PostDown lines are ignored.",
+        "awg_st_unknown": "— open this tab or press ⟳",
+        "awg_st_loading": "fetching state…",
+        "awg_st_missing": "AmneziaWG is not installed on the server",
+        "awg_st_old":     "the server cannot manage AmneziaWG — update it (Update button)",
+        "awg_st_off":     "Off — traffic to the proxy goes direct",
+        "awg_st_on":      "On · profile {} · handshake {} · ↓ {}  ↑ {}",
+        "awg_st_nohs":    "On · profile {} · no handshake with the server yet",
+        "awg_st_broken":  "On, but the tunnel is {} — check the profile",
+        "awg_st_noroute": "On, but the route via awg0 is missing — turn it off and on again",
+        "awg_ago_s":      "{} s ago",
+        "awg_ago_m":      "{} min ago",
+        "awg_enabling":   "Turning AmneziaWG on: tunnel and proxy check…",
+        "awg_disabling":  "Turning AmneziaWG off…",
+        "awg_switching":  "Switching AmneziaWG profile…",
+        "awg_saving":     "Saving profile…",
+        "awg_removing":   "Deleting profile…",
+        "awg_on_ok":      "✓ AmneziaWG is on, profile {}",
+        "awg_off_ok":     "✓ AmneziaWG is off — traffic to the proxy goes direct",
+        "awg_added":      "✓ Profile {} added ({})",
+        "awg_deleted":    "✓ Profile {} deleted",
+        "awg_active_set": "✓ Active profile: {} (used when turned on)",
+        "awg_switched":   "✓ AmneziaWG switched to profile {}",
+        "awg_pick":       "AmneziaWG config",
+        "awg_name_title": "AmneziaWG profile",
+        "awg_name_ask":   "Profile name (letters, digits, _ . -, up to 32 chars):",
+        "awg_del_ask":    "Delete profile \"{}\"?",
+        "awg_nosel":      "Select a profile in the list",
+        "awg_err":        "AmneziaWG: {}",
+        "awg_file_err":   "Could not read the file: {}",
+        "awg_file_big":   "The file is too large for an AmneziaWG config",
+        "awg_ok_st":      "AmneziaWG ✓",
+        "srv_awg_on":     "   › AmneziaWG: on, profile {} ({})",
+        "srv_awg_off":    "   › AmneziaWG: off",
         "hist_loaded":    "Loaded from history: {}",
         "hist_checking":  "Checking proxy from history…",
     },
@@ -813,11 +911,15 @@ class App:
 
         self.tab_main = tk.Frame(self.notebook, bg=self.BG)
         self.tab_hist = tk.Frame(self.notebook, bg=self.BG)
+        self.tab_awg = tk.Frame(self.notebook, bg=self.BG)
         self.notebook.add(self.tab_main, text="Управление")
         self.notebook.add(self.tab_hist, text="История")
+        self.notebook.add(self.tab_awg, text="AmneziaWG")
 
         self._build_main_tab()
         self._build_history_tab()
+        self._build_awg_tab()
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
     def _card(self, parent, accent=None, expand=False, pady=(0, 12)):
         """Карточка-секция: лёгкая рамка, опциональная акцентная полоса слева."""
@@ -1065,6 +1167,88 @@ class App:
 
         self._refresh_hist_table()
 
+    def _build_awg_tab(self):
+        p = self.tab_awg
+        self._awg_state = None
+        self._awg_state_err = ""
+
+        head = tk.Frame(p, bg=self.BG)
+        head.pack(fill="x", padx=18, pady=(16, 4))
+        tk.Frame(head, bg=self.GREEN, width=4, height=26).pack(side="left", padx=(0, 12))
+        self.lbl_awg_title = tk.Label(head, bg=self.BG, fg=self.TEXT,
+                                      font=("Segoe UI Semibold", 14, "bold"))
+        self.lbl_awg_title.pack(side="left")
+        self.lbl_awg_sub = tk.Label(p, bg=self.BG, fg=self.MUTED, font=("Segoe UI", 9),
+                                    anchor="w", justify="left", wraplength=740)
+        self.lbl_awg_sub.pack(fill="x", padx=18, pady=(0, 12))
+
+        # ── Состояние + кнопка вкл/выкл ──────────────────────────────────────
+        st = self._card(p, accent=self.GREEN)
+        self.lbl_awg_sec_state = self._sec(st)
+        row = tk.Frame(st, bg=self.CARD)
+        row.pack(fill="x")
+        self.btn_awg_refresh = RoundedButton(row, text="⟳", width=42, height=34, radius=9,
+                                             bg=self.SURF, fg=self.TEXT, hover=self.SURF2,
+                                             page_bg=self.CARD, font=("Segoe UI", 13, "bold"),
+                                             command=self._awg_refresh)
+        self.btn_awg_refresh.pack(side="right")
+        self.btn_awg_toggle = RoundedButton(row, text="", width=150, height=34,
+                                            bg=self.SURF, fg=self.MUTED, hover=self.SURF2,
+                                            page_bg=self.CARD, font=("Segoe UI", 10, "bold"),
+                                            command=self._awg_toggle)
+        self.btn_awg_toggle.pack(side="right", padx=(0, 8))
+        self.lbl_awg_dot = tk.Label(row, text="●", bg=self.CARD, fg=self.MUTED,
+                                    font=("Segoe UI", 12))
+        self.lbl_awg_dot.pack(side="left", padx=(0, 10))
+        self.lbl_awg_state = tk.Label(row, bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 10),
+                                      anchor="w", justify="left", wraplength=480)
+        self.lbl_awg_state.pack(side="left", fill="x", expand=True)
+
+        # ── Профили ──────────────────────────────────────────────────────────
+        card = tk.Frame(p, bg=self.CARD, highlightbackground=self.BORDER,
+                        highlightthickness=1)
+        card.pack(fill="both", expand=True, padx=18, pady=(0, 10))
+        inner = tk.Frame(card, bg=self.CARD)
+        inner.pack(fill="both", expand=True, padx=12, pady=10)
+        self.lbl_awg_sec_prof = tk.Label(inner, bg=self.CARD, fg=self.MUTED,
+                                         font=("Segoe UI", 8, "bold"))
+        self.lbl_awg_sec_prof.pack(anchor="w", pady=(0, 8))
+        tree_frame = tk.Frame(inner, bg=self.CARD)
+        tree_frame.pack(fill="both", expand=True)
+        sb = ttk.Scrollbar(tree_frame, orient="vertical", style="Hist.Vertical.TScrollbar")
+        self.awg_tree = ttk.Treeview(
+            tree_frame, style="Hist.Treeview",
+            columns=("active", "name", "endpoint", "address"),
+            show="headings", selectmode="browse", yscrollcommand=sb.set,
+        )
+        sb.config(command=self.awg_tree.yview)
+        sb.pack(side="right", fill="y")
+        self.awg_tree.pack(fill="both", expand=True)
+        self.awg_tree.column("active",   width=34,  minwidth=34,  anchor="center", stretch=False)
+        self.awg_tree.column("name",     width=180, minwidth=120, anchor="w")
+        self.awg_tree.column("endpoint", width=230, minwidth=140, anchor="w")
+        self.awg_tree.column("address",  width=160, minwidth=100, anchor="w")
+        self.awg_tree.tag_configure("active", foreground=self.GREEN)
+
+        btn_frame = tk.Frame(p, bg=self.BG)
+        btn_frame.pack(fill="x", padx=18, pady=(0, 6))
+        self.btn_awg_add = RoundedButton(btn_frame, text="", width=170, height=34,
+                                         bg=self.SURF, fg=self.TEXT, hover=self.SURF2,
+                                         page_bg=self.BG, command=self._awg_add)
+        self.btn_awg_add.pack(side="left")
+        self.btn_awg_act = RoundedButton(btn_frame, text="", width=160, height=34,
+                                         bg=self.SURF, fg=self.TEXT, hover=self.SURF2,
+                                         page_bg=self.BG, command=self._awg_activate)
+        self.btn_awg_act.pack(side="left", padx=(8, 0))
+        self.btn_awg_del = RoundedButton(btn_frame, text="", width=120, height=34,
+                                         bg=self.SURF, fg=self.RED, hover=self.SURF2,
+                                         page_bg=self.BG, command=self._awg_delete)
+        self.btn_awg_del.pack(side="left", padx=(8, 0))
+
+        self.lbl_awg_hint = tk.Label(p, bg=self.BG, fg=self.MUTED, font=("Segoe UI", 8),
+                                     anchor="w", justify="left", wraplength=740)
+        self.lbl_awg_hint.pack(fill="x", padx=18, pady=(0, 12))
+
     def _entry(self, parent, var, width=30):
         return tk.Entry(
             parent, textvariable=var, width=width,
@@ -1127,6 +1311,20 @@ class App:
                          ("status", "hist_col_st")]:
             self.hist_tree.heading(col, text=t[key])
 
+        self.notebook.tab(2, text=t["tab_awg"])
+        self.lbl_awg_title.config(text=t["awg_title"])
+        self.lbl_awg_sub.config(text=t["awg_sub"])
+        self.lbl_awg_sec_state.config(text=t["awg_sec_state"])
+        self.lbl_awg_sec_prof.config(text=t["awg_sec_prof"])
+        self.btn_awg_add.config_text(t["awg_btn_add"])
+        self.btn_awg_act.config_text(t["awg_btn_act"])
+        self.btn_awg_del.config_text(t["awg_btn_del"])
+        self.lbl_awg_hint.config(text=t["awg_hint"])
+        for col, key in [("active", None), ("name", "awg_col_name"),
+                         ("endpoint", "awg_col_ep"), ("address", "awg_col_addr")]:
+            self.awg_tree.heading(col, text=t[key] if key else "")
+        self._awg_show(self._awg_state, self._awg_state_err)
+
     def _paste_proxy(self, event):
         try:
             text = self.root.clipboard_get()
@@ -1165,8 +1363,210 @@ class App:
         st = "normal" if enabled else "disabled"
         for b in (self.btn_apply, self.btn_stop, self.btn_check, self.btn_udp, self.btn_clean,
                   self.btn_server, self.btn_cur, self.btn_health, self.btn_hist_load,
-                  self.btn_hist_check, self.btn_hist_delete, self.btn_update):
+                  self.btn_hist_check, self.btn_hist_delete, self.btn_update,
+                  self.btn_awg_refresh, self.btn_awg_add, self.btn_awg_act, self.btn_awg_del):
             b.set_state(st)
+        self._busy = not enabled
+        # Кнопку вкл/выкл включаем только когда известно, что AmneziaWG есть.
+        self.btn_awg_toggle.set_state(
+            "normal" if enabled and (self._awg_state or {}).get("installed") else "disabled")
+
+    # ── AmneziaWG ─────────────────────────────────────────────────────────────
+
+    def _on_tab_changed(self, _e=None):
+        if self.notebook.index(self.notebook.select()) == 2 and not getattr(self, "_busy", False):
+            self._awg_refresh()
+
+    def _fmt_bytes(self, n: float) -> str:
+        units = ("Б", "КБ", "МБ", "ГБ") if self.lang == "ru" else ("B", "KB", "MB", "GB")
+        for i, unit in enumerate(units):
+            if n < 1024 or i == len(units) - 1:
+                return f"{n:.0f} {unit}" if i == 0 else f"{n:.1f} {unit}"
+            n /= 1024
+
+    def _awg_show(self, state, err: str = ""):
+        """Отрисовать состояние AmneziaWG (или ошибку запроса) на вкладке."""
+        self._awg_state, self._awg_state_err = state, err
+        t = S[self.lang]
+        on = False
+        if state is None:
+            color, text = self.MUTED, err or t["awg_st_unknown"]
+        elif not state.get("installed"):
+            color, text = self.MUTED, t["awg_st_missing"]
+        elif state.get("enabled"):
+            on = True
+            prof = state.get("profile") or "?"
+            age = state.get("handshake_age")
+            if state.get("service") != "active":
+                color, text = self.RED, t["awg_st_broken"].format(state.get("service", "?"))
+            elif not state.get("route_ok"):
+                color, text = self.YELLOW, t["awg_st_noroute"]
+            elif age is None:
+                color, text = self.YELLOW, t["awg_st_nohs"].format(prof)
+            else:
+                ago = (t["awg_ago_s"].format(age) if age < 120
+                       else t["awg_ago_m"].format(age // 60))
+                # Без трафика WireGuard рукопожатие не обновляет — старое не ошибка.
+                color = self.GREEN if age < 300 else self.YELLOW
+                text = t["awg_st_on"].format(prof, ago, self._fmt_bytes(state.get("rx", 0)),
+                                             self._fmt_bytes(state.get("tx", 0)))
+        else:
+            color, text = self.SUB, t["awg_st_off"]
+        self.lbl_awg_dot.config(fg=color)
+        self.lbl_awg_state.config(text=text, fg=color)
+
+        if on:
+            self.btn_awg_toggle.config_text(t["awg_btn_off"])
+            self.btn_awg_toggle.set_colors(bg=self.RED, fg=self.BG, hover="#cc3333")
+        else:
+            self.btn_awg_toggle.config_text(t["awg_btn_on"])
+            self.btn_awg_toggle.set_colors(bg=self.GREEN, fg=self.BG, hover="#8fd18a")
+        ready = bool(state and state.get("installed")) and not getattr(self, "_busy", False)
+        self.btn_awg_toggle.set_state("normal" if ready else "disabled")
+
+        if state is not None:
+            sel = self.awg_tree.selection()
+            self.awg_tree.delete(*self.awg_tree.get_children())
+            for prof in state.get("profiles", []):
+                self.awg_tree.insert("", "end", iid=prof["name"],
+                                     values=("●" if prof.get("active") else "", prof["name"],
+                                             prof.get("endpoint", ""), prof.get("address", "")),
+                                     tags=("active",) if prof.get("active") else ())
+            keep = [i for i in sel if self.awg_tree.exists(i)]
+            if keep:
+                self.awg_tree.selection_set(keep)
+
+    def _awg_request(self, method: str, path: str, payload=None, busy: str = "", on_ok=None):
+        """Запрос к /awg/* в фоне. busy — текст статуса для действий (кнопки на время
+        блокируются); без него — тихое обновление состояния."""
+        ubuntu_ip = self.ip_var.get().strip()
+        if not ubuntu_ip:
+            self._log(self._("err_no_ip"), "err")
+            return
+        if busy:
+            self._set_buttons(False)
+            self._status(busy, self.YELLOW)
+            self._log(f"→  {method} http://{ubuntu_ip}:{SERVER_PORT}{path}", "info")
+        else:
+            self.lbl_awg_state.config(text=self._("awg_st_loading"), fg=self.MUTED)
+        url = f"http://{ubuntu_ip}:{SERVER_PORT}{path}"
+
+        def worker():
+            err = data = None
+            try:
+                r = requests.request(method, url, json=payload, timeout=AWG_TIMEOUT)
+                try:
+                    data = r.json()
+                except ValueError:
+                    data = {}
+                if r.status_code >= 400:
+                    detail = data.get("detail") if isinstance(data, dict) else None
+                    if r.status_code == 404 and detail == "Not Found":
+                        err = self._("awg_st_old")
+                    else:
+                        err = detail if isinstance(detail, str) else f"HTTP {r.status_code}"
+            except requests.exceptions.ConnectionError:
+                err = self._("log_conn_err", ubuntu_ip, SERVER_PORT)
+            except requests.exceptions.Timeout:
+                err = self._("log_timeout", AWG_TIMEOUT)
+            except Exception as e:
+                err = str(e)
+            self.root.after(0, self._awg_done, data, err, busy, on_ok)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _awg_done(self, data, err, busy, on_ok):
+        if busy:
+            self._set_buttons(True)
+        if err:
+            self._log(self._("awg_err", err), "err")
+            if busy:
+                self._status(self._("st_err"), self.RED)
+                self._awg_show(self._awg_state)
+            else:
+                self._awg_show(None, err)
+            return
+        self._awg_show(data.get("awg", data))
+        if on_ok:
+            on_ok(data)
+
+    def _awg_refresh(self):
+        self._awg_request("GET", "/awg/status")
+
+    def _awg_toggle(self):
+        if (self._awg_state or {}).get("enabled"):
+            def ok(_d):
+                self._log(self._("awg_off_ok"), "ok")
+                self._status(self._("awg_ok_st"), self.GREEN)
+            self._awg_request("POST", "/awg/disable", busy=self._("awg_disabling"), on_ok=ok)
+        else:
+            def ok(d):
+                self._log(self._("awg_on_ok", d.get("awg", {}).get("profile") or "?"), "ok")
+                self._status(self._("awg_ok_st"), self.GREEN)
+            self._awg_request("POST", "/awg/enable", payload={},
+                              busy=self._("awg_enabling"), on_ok=ok)
+
+    def _awg_selected(self):
+        sel = self.awg_tree.selection()
+        if not sel:
+            self._log(self._("awg_nosel"), "warn")
+            return None
+        return sel[0]
+
+    def _awg_add(self):
+        path = filedialog.askopenfilename(
+            parent=self.root, title=self._("awg_pick"),
+            filetypes=[("AmneziaWG", "*.conf"), ("*", "*.*")])
+        if not path:
+            return
+        try:
+            if os.path.getsize(path) > AWG_MAX_CONF:
+                self._log(self._("awg_file_big"), "err")
+                return
+            with open(path, encoding="utf-8-sig") as f:
+                text = f.read()
+        except (OSError, UnicodeDecodeError) as e:
+            self._log(self._("awg_file_err", e), "err")
+            return
+        stem = os.path.splitext(os.path.basename(path))[0]
+        default = re.sub(r"[^\w.-]+", "_", stem).strip("._-")[:32] or "profile"
+        name = simpledialog.askstring(self._("awg_name_title"), self._("awg_name_ask"),
+                                      initialvalue=default, parent=self.root)
+        if not name or not name.strip():
+            return
+        name = name.strip()
+
+        def ok(d):
+            self._log(self._("awg_added", name, d.get("endpoint") or "?"), "ok")
+            self._status(self._("awg_ok_st"), self.GREEN)
+        self._awg_request("POST", "/awg/profiles", payload={"name": name, "config": text},
+                          busy=self._("awg_saving"), on_ok=ok)
+
+    def _awg_activate(self):
+        name = self._awg_selected()
+        if name is None:
+            return
+        enabled = (self._awg_state or {}).get("enabled")
+
+        def ok(d):
+            self._log(self._("awg_switched" if d.get("applied") else "awg_active_set", name), "ok")
+            self._status(self._("awg_ok_st"), self.GREEN)
+        self._awg_request("POST", f"/awg/profiles/{quote(name, safe='')}/activate",
+                          busy=self._("awg_switching" if enabled else "awg_saving"), on_ok=ok)
+
+    def _awg_delete(self):
+        name = self._awg_selected()
+        if name is None:
+            return
+        if not messagebox.askyesno(self._("awg_name_title"), self._("awg_del_ask", name),
+                                   parent=self.root):
+            return
+
+        def ok(_d):
+            self._log(self._("awg_deleted", name), "ok")
+            self._status(self._("awg_ok_st"), self.GREEN)
+        self._awg_request("DELETE", f"/awg/profiles/{quote(name, safe='')}",
+                          busy=self._("awg_removing"), on_ok=ok)
 
     # ── Применить прокси ──────────────────────────────────────────────────────
 
@@ -1808,6 +2208,13 @@ class App:
             self._("srv_proxy", proxy) if proxy else self._("srv_no_proxy"),
             "info" if proxy else "warn",
         )
+        awg = data.get("awg") or {}
+        if awg.get("installed"):
+            if awg.get("enabled"):
+                self._log(self._("srv_awg_on", awg.get("profile") or "?", awg.get("service", "?")),
+                          "info" if awg.get("service") == "active" else "warn")
+            else:
+                self._log(self._("srv_awg_off"), "info")
         self._status(
             self._("srv_st_ok") if all_ok else self._("srv_st_warn"),
             self.GREEN if all_ok else self.YELLOW,

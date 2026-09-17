@@ -89,6 +89,22 @@ This means QUIC/HTTP3, WebRTC STUN, and all other UDP traffic is proxied — not
 
 The client includes a **Check UDP** button that tests whether the upstream proxy supports UDP ASSOCIATE before routing.
 
+### AmneziaWG tunnel to the proxy (optional)
+
+If the box's ISP throttles or blocks the direct path to the proxy, the server's traffic **to the proxy** can go through an AmneziaWG tunnel.
+- **What goes through the tunnel:** sing-box's proxy connections, the fast relay and the proxy probes. They are marked with `routing_mark 100`, and `ip rule fwmark 100 → table 200 → default dev awg0` sends them into the tunnel.
+- **What doesn't:** SSH, GitHub updates and all other traffic of the box. The tunnel is brought up with `Table = off`.
+- **What devices see:** their exit IP is still the proxy's.
+
+Install once on the box: `sudo add-apt-repository ppa:amnezia/ppa && sudo apt install amneziawg`.
+
+Everything else is done from the client's **AmneziaWG** tab:
+- **Turn on / Turn off.** Turning on brings up `awg-quick@awg0` and checks that the proxy is reachable through the tunnel, then re-probes the proxy over the new path and restarts sing-box. If the proxy cannot be reached through the tunnel, the previous state is restored.
+- **Profiles.** Add, delete and make active. A profile is a `.conf` exported from Amnezia (AmneziaWG). Profiles are stored in `/etc/amnezia/amneziawg/profiles/`, and the active one is copied to `awg0.conf`.
+- **Checks on upload.** Every upload is checked with `awg-quick strip` and `awg setconf` on a temporary interface.
+- **Ignored lines.** `DNS`, `Table` and all `PreUp`/`PostUp`/`PreDown`/`PostDown` lines from the file are dropped, because hooks are root commands and the API has no authentication.
+- **What cannot be done.** The active profile cannot be deleted while the tunnel is on.
+
 ### Components
 
 | File | Description |
@@ -292,6 +308,12 @@ POST /set_proxy     {"proxy_string": "ip:port:user:pass"}
 GET  /status        → {"sing_box": "active", "dnsmasq": "active", "iptables": "ok", "proxy": "1.2.3.4:1080"}
 GET  /current_ip    → {"ok": true, "exit_ip": "5.6.7.8", "countryCode": "US", "city": "...", "isp": "..."}
 GET  /proxy_health  → {"ok": true, "stalled": false, "got_bytes": 524288, "elapsed": 2.1, "kbps": 243.0}
+GET    /awg/status                 → {"installed", "enabled", "service", "profile", "profiles": [...], "handshake_age", "rx", "tx", "route_ok"}
+POST   /awg/enable                 {"profile": "name"}   (profile is optional)
+POST   /awg/disable
+POST   /awg/profiles               {"name": "name", "config": "<.conf text>"}
+POST   /awg/profiles/{name}/activate
+DELETE /awg/profiles/{name}
 ```
 
 ---
@@ -363,6 +385,22 @@ JackalRouter использует **SOCKS5 UDP ASSOCIATE**:
 Это означает что QUIC/HTTP3, WebRTC STUN и весь остальной UDP проксируется, а не блокируется. Блокировка UDP повышает fraud-score в антидетект-системах (у настоящего резидентного IP всегда работает QUIC).
 
 Клиент содержит кнопку **Проверить UDP**, которая тестирует поддержку UDP ASSOCIATE у прокси перед применением.
+
+### Туннель AmneziaWG до прокси (по желанию)
+
+Если провайдер коробки душит или блокирует прямой путь до прокси, трафик сервера **к прокси** можно пустить через AmneziaWG.
+- **Что идёт в туннель:** соединения sing-box с прокси, ускоритель рукопожатия и пробы прокси. Они помечаются `routing_mark 100`, и правило `ip rule fwmark 100 → table 200 → default dev awg0` отправляет их в туннель.
+- **Что не идёт:** SSH, обновления с GitHub и прочий трафик коробки. Туннель поднимается с `Table = off`.
+- **Что видят устройства:** выходной IP по-прежнему IP прокси.
+
+Установить один раз на коробке: `sudo add-apt-repository ppa:amnezia/ppa && sudo apt install amneziawg`.
+
+Остальное делается во вкладке **AmneziaWG** клиента:
+- **Включить / Выключить.** При включении поднимается `awg-quick@awg0` и проверяется, что прокси доступен через туннель. Затем прокси заново проверяется по новому пути, и sing-box перезапускается. Если через туннель прокси недоступен, всё возвращается как было.
+- **Профили.** Их можно добавлять, удалять и делать активными. Профиль — это `.conf`, экспортированный из Amnezia (AmneziaWG). Профили хранятся в `/etc/amnezia/amneziawg/profiles/`, активный копируется в `awg0.conf`.
+- **Проверка при загрузке.** Каждый загруженный профиль проверяется через `awg-quick strip` и `awg setconf` на временном интерфейсе.
+- **Игнорируемые строки.** `DNS`, `Table` и все `PreUp`/`PostUp`/`PreDown`/`PostDown` из файла отбрасываются: хуки — это команды от root, а у API нет авторизации.
+- **Чего сделать нельзя.** Активный профиль нельзя удалить, пока туннель включён.
 
 ### Состав проекта
 
@@ -570,6 +608,12 @@ POST /set_proxy     {"proxy_string": "ip:port:user:pass"}
 GET  /status        → {"sing_box": "active", "dnsmasq": "active", "iptables": "ok", "proxy": "1.2.3.4:1080"}
 GET  /current_ip    → {"ok": true, "exit_ip": "5.6.7.8", "countryCode": "US", "city": "...", "isp": "..."}
 GET  /proxy_health  → {"ok": true, "stalled": false, "got_bytes": 524288, "elapsed": 2.1, "kbps": 243.0}
+GET    /awg/status                 → {"installed", "enabled", "service", "profile", "profiles": [...], "handshake_age", "rx", "tx", "route_ok"}
+POST   /awg/enable                 {"profile": "name"}   (profile is optional)
+POST   /awg/disable
+POST   /awg/profiles               {"name": "name", "config": "<.conf text>"}
+POST   /awg/profiles/{name}/activate
+DELETE /awg/profiles/{name}
 ```
 
 ### Управление сервисом
