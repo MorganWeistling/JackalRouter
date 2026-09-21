@@ -60,20 +60,28 @@ Standard transparent proxies must resolve DNS to get an IP, then connect by IP �
 
 This means the proxy always receives the real hostname. No DNS query from a device ever reaches the network directly. HTTPS/SVCB DNS record types (64/65) are rejected to prevent Cloudflare and other CDNs from bypassing FakeIP via `ipv4hint`.
 
-### How the resolver transport is chosen
+### How the resolver is chosen
 
 Resolving the real address behind a FakeIP always happens **through the proxy tunnel** (`proxy-dns`), never over the box's own WAN — resolving directly would expose the operator's real IP to the resolver, which is exactly what this project exists to prevent. The only exception is the proxy's own hostname, which has to be resolved directly (you cannot reach the proxy before you know its address).
 
-Which transport carries those queries is decided per proxy, by probing the upstream when a proxy is applied:
+The transport is decided per proxy, by probing the upstream when a proxy is applied. The first row that works is used:
 
-| Upstream allows | Transport used | Why |
+| # | Transport | Why |
 |---|---|---|
-| TCP `:53` through the proxy | plain DNS-over-TCP to `8.8.8.8` | Default — the historical behaviour, kept for every proxy that supports it |
-| `:53` blocked, `:443` open | **DoH** (RFC 8484) to `8.8.8.8`, else `1.1.1.1` | Residential gateways (e.g. nsocks.com) reject *any* destination on port 53/853 with SOCKS reply code 2 (`not allowed by ruleset`) as anti-abuse. Since `proxy-dns` backs `dns.final`, `route.default_domain_resolver` *and* the per-connection `resolve` rule, a blocked `:53` means nothing resolves at all and devices simply hang |
+| 1 | **DoH** (RFC 8484) to `1.1.1.1` | Preferred. sing-box's plain `tcp` transport opens a new connection per query (a full SOCKS5 handshake through the proxy), whereas DoH keeps one HTTP/2 connection open, which is about 4 RTT faster on a new domain. It also hides the queried names from the proxy provider. |
+| 2 | plain DNS-over-TCP to `1.1.1.1:53` | The upstream refuses `:443` to the resolver but allows `:53`. |
+| 3 | DoH to `8.8.8.8` | The upstream refuses `1.1.1.1` entirely. |
+| 4 | plain DNS-over-TCP to `8.8.8.8:53` | What the whole fleet used before the resolver order changed. |
 
-The DoH resolver is always addressed by **IP literal**, so no bootstrap lookup is needed (which would be a DNS loop) and certificate validation stays fully enabled — `8.8.8.8` and `1.1.1.1` are present in their certificates' IP SANs. Note that DoH is HTTP/2 over TCP; HTTP/3 (`h3`) is deliberately not used, since QUIC may be blocked or unsupported by the same upstream.
+Residential gateways (e.g. nsocks.com) reject *any* destination on port 53/853 with SOCKS reply code 2 (`not allowed by ruleset`) as anti-abuse. Since `proxy-dns` backs `dns.final`, `route.default_domain_resolver` *and* the per-connection `resolve` rule, a blocked `:53` would mean nothing resolves at all, which is why DoH is tried first.
 
-If neither transport is reachable the box stays on plain `:53` and logs a warning — it never silently falls back to resolving over the real WAN, as that would trade a broken proxy for a DNS leak.
+**Why Cloudflare rather than Google.** Websites can run a DNS-leak check: they make the browser look up a unique name and see which recursive resolvers ask for it. A resolver whose country differs from the IP's country is a well-known proxy tell (whoer.net takes 30% off its "disguise" score for it). Measured with a Spanish exit IP: Google Public DNS shows up from US addresses (AS15169), Cloudflare answers from the nearest PoP to the exit node and shows up from Spain (AS13335).
+
+**Why not let the proxy resolve names (`ATYP=domain`).** Measured on the same proxy, this gives about 80% Google-US resolvers plus a few of the exit ISP's own, so the mismatch stays. It also lets the provider pick IPv6 for dual-stack sites: the site then sees an IPv6 address instead of the IPv4 one used everywhere else in the same session. The box resolves to IPv4 itself (`ipv4_only`) and hands the proxy an address, so a session always has one exit IP. On top of that, the names become visible to the provider in clear text, and on some gateways DNS is resolved in a different country than the exit.
+
+The DoH resolver is always addressed by **IP literal**, so no bootstrap lookup is needed (which would be a DNS loop) and certificate validation stays fully enabled: `1.1.1.1` and `8.8.8.8` are present in their certificates' IP SANs. DoH here is HTTP/2 over TCP; HTTP/3 (`h3`) is deliberately not used, since QUIC may be blocked or unsupported by the same upstream.
+
+If no resolver is reachable the box stays on plain `:53` and logs a warning. It never silently falls back to resolving over the real WAN, as that would trade a broken proxy for a DNS leak.
 
 ### How UDP proxying works
 

@@ -41,12 +41,22 @@ GITHUB_REPO  = "MorganWeistling/JackalRouter"   # источник для кно
 GITHUB_REF   = "main"
 
 # Резолвер, которым sing-box резолвит ВЕСЬ клиентский трафик — ходит через прокси.
-# Только IP-литералы: у сертификатов 8.8.8.8 и 1.1.1.1 адрес прописан в IP SAN,
+# Только IP-литералы: у сертификатов 1.1.1.1 и 8.8.8.8 адрес прописан в IP SAN,
 # поэтому режим DoH работает с полной проверкой сертификата и без bootstrap-
 # резолва самого резолвера (иначе получили бы ту же DNS-петлю, что и с доменом
 # прокси). ALT пробуется, только если основной недоступен через прокси.
-PROXY_DNS_IP   = "8.8.8.8"
-PROXY_DNS_ALT  = "1.1.1.1"
+#
+# Основной — Cloudflare, не Google: сайты умеют по «DNS-утечке» проверять, что
+# страна резолверов совпадает со страной IP (whoer.net снимает за несовпадение
+# 30% «маскировки»). Замерено на живой коробке с прокси в Испании: резолверы
+# Google для такого клиента — США/Бельгия (AS15169), а Cloudflare отвечает с
+# ближайшего PoP выходной ноды — Испания (AS13335). У Google мало площадок и
+# рекурсивные запросы уходят с адресов, которые почти везде геолоцируются в США.
+PROXY_DNS_IP   = "1.1.1.1"
+PROXY_DNS_ALT  = "8.8.8.8"
+# Резолвер для адреса самого прокси (мимо туннеля, см. direct-dns): на детект не
+# влияет, поэтому остаётся прежним — то, что уже работает на всём парке.
+DIRECT_DNS_IP  = "8.8.8.8"
 PROBE_TIMEOUT  = 5    # лимит на ОДНУ пробу апстрима
 PROBE_DEADLINE = 9    # лимит на ВСЕ пробы разом: клиент ждёт /set_proxy 15 с
 # Локальный ускоритель SOCKS5-рукопожатия (см. FastRelay). Только loopback.
@@ -445,7 +455,7 @@ def make_singbox_conf(ip: str, port: int, user: str, password: str,
             {"type": "fakeip", "tag": "fakeip", "inet4_range": "198.18.0.0/15"},
             proxy_dns_server,
             # Без detour — используется только для адреса самого прокси
-            {"type": "tcp", "tag": "direct-dns", "server": PROXY_DNS_IP},
+            {"type": "tcp", "tag": "direct-dns", "server": DIRECT_DNS_IP},
         ],
         "rules": dns_rules,
         "final": "proxy-dns",
@@ -1034,12 +1044,16 @@ def probe_proxy(ip: str, port: int, user: str, password: str) -> dict:
         # домен, а правило "resolve" гоняет резолв перед КАЖДЫМ новым соединением.
         # DoH держит HTTP/2-соединение открытым — на тёплом канале ~1 RTT.
         # Утечек это не добавляет: оба транспорта идут через detour=proxy на тот
-        # же 8.8.8.8, а DoH ещё и прячет домены от самого прокси-провайдера.
+        # же резолвер, а DoH ещё и прячет домены от самого прокси-провайдера.
         dns_mode, dns_server = "doh", PROXY_DNS_IP
     elif tcp53_ok:
         dns_mode, dns_server = "tcp53", PROXY_DNS_IP
     elif probe_dns_doh(ip, port, user, password, PROXY_DNS_ALT, PROBE_TIMEOUT):
         dns_mode, dns_server = "doh", PROXY_DNS_ALT
+    elif probe_dns_tcp53(ip, port, user, password, PROXY_DNS_ALT, PROBE_TIMEOUT):
+        # Провайдер закрыл основной резолвер целиком, но пускает запасной по :53 —
+        # так работал весь парк, пока основным был 8.8.8.8.
+        dns_mode, dns_server = "tcp53", PROXY_DNS_ALT
     else:
         # Ни :53, ни DoH. На direct-dns НЕ откатываемся ни при каких условиях:
         # резолв мимо туннеля — это утечка DNS через реальный IP коробки, ровно
